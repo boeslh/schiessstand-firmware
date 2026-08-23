@@ -4,7 +4,7 @@ rem Anderen Port: flash.bat COM5
 
 setlocal
 set PORT=%~1
-if "%PORT%"=="" set PORT=COM3
+if "%PORT%"=="" set PORT=COM5
 
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0flash.ps1" -Port %PORT%
 

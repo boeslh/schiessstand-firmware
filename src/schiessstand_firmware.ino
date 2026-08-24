@@ -1,6 +1,25 @@
 /*
  * ============================================================================
  *  Elektronischer Schießstand – ESP32 Firmware
+ *  Rev 4.6.1 – Protokoll fuer die Stand-PC-Anzeige entkoppelt von SET DEBUG:
+ *              "shot"- und "reject"-Telegramme gehen jetzt IMMER raus (auch
+ *              bei Ausreissern/zu wenigen Mics), jede Ausloesung bekommt
+ *              dafuer immer eine fortlaufende "seq"-Nummer (auch Rejects -
+ *              vorher nur bei genug Mics vergeben). Neues Feld "clean" im
+ *              "shot"-Telegramm uebernimmt die bisherige DEBUG=0-Filterlogik,
+ *              damit die Anzeige "saubere" Treffer erkennen kann, ohne die
+ *              Schwellenlogik selbst nachzubilden. SET DEBUG steuert nur noch
+ *              die zusaetzlichen Diagnosefelder (type=cand, x_um_pre/...).
+ * ============================================================================
+ *
+ *  Rev 4.6.0 – Mic-Standoff (rechtwinklig zur Platte/Scheibe) ist jetzt zur
+ *              Laufzeit konfigurierbar statt fest einkompiliert: SET
+ *              STANDOFFSTEEL/SET STANDOFFPAPER (je 5.0-100.0mm, Default
+ *              30.0/28.0 - vorher MIC_STANDOFF_STEEL/MIC_STANDOFF_PAPER
+ *              Compile-Konstanten). Wirkt sofort (applyTargetGeometry()),
+ *              kein Reboot noetig, wird in SHOW mit ausgegeben.
+ * ============================================================================
+ *
  *  Rev 4.5.1 – Zwei Aenderungen an CAL START:
  *              1. airHits (Reject-/Kalibrier-Schwelle) wurde bisher VOR der
  *              SET MICEN-Maskierung aus den rohen ISR-Zaehlern berechnet -
@@ -241,7 +260,7 @@
  *  Telegramm:
  *    {"type":"shot","seq":8,"air_ns":[[0,...],[...],[...],[...],[...],[...]],
  *     "x_um":-22300,"y_um":-300,"pos_res_um":43910,"precision_um":120,
- *     "cluster_hits":3,"pos_valid":1,"hits":4,"ts":123456789}
+ *     "cluster_hits":3,"pos_valid":1,"clean":1,"hits":4,"ts":123456789}
  *    air_ns[i] = Liste ALLER erfassten Flanken von Mikrofon i, in ns
  *    relativ zum ersten erfassten Mikrofon. Leere Liste = keine Flanke.
  *
@@ -297,19 +316,27 @@
  *  SET DEBUG=3 gibt zusaetzlich die Stufe-1-Werte aus ("x_um_pre"/"y_um_pre"/
  *  "precision_um_pre"/"cluster_hits_pre"), sonst nur das Endergebnis.
  *
- *  SET DEBUG=0-3 (persistent im NVS) filtert, welche Schuss-/Reject-/
- *  Kandidaten-Telegramme ausgegeben werden (Zähler/shotCounter laufen davon
- *  unabhängig immer mit):
- *    0 (Default): nur sauber ermittelte Schüsse (Position bestimmbar,
- *      pos_res_um < SET OUTLIER-Schwelle, cluster_hits >= SET MINCLUSTER,
- *      precision_um <= SET MAXPRECISION)
- *    1: zusätzlich Schüsse mit Mikrofon-Ausreißer bzw. nicht
- *      bestimmbarer Position (pos_valid=0)
- *    2: zusätzlich Reject-Telegramme wegen zu weniger Mics (<3)
- *    3: zusätzlich je Schuss eine Zeile PRO ausgewerteter Mic-Kombination
+ *  Protokoll (Rev 4.6.1): JEDE Ausloesung (>= SET MINMICS Mics oder nicht)
+ *  erzeugt IMMER ein Telegramm ("type":"shot" bzw. "type":"reject" bei zu
+ *  wenigen Mics) mit fortlaufender "seq"-Nummer - unabhaengig von SET DEBUG
+ *  und unabhaengig davon, ob der Schuss "sauber" war. Damit kommt bei der
+ *  Anzeige zu jeder Sequenz-Nummer etwas an, auch bei Ausreissern oder zu
+ *  duennen Schuessen. Ein "shot"-Telegramm traegt zusaetzlich das Feld
+ *  "clean" (1/0): fasst zusammen, ob der Schuss allen Qualitaetsschwellen
+ *  genuegt (Position bestimmbar, pos_res_um < SET OUTLIER, cluster_hits >=
+ *  SET MINCLUSTER, precision_um <= SET MAXPRECISION, und - falls SET
+ *  PIEZO=1 - vom Piezo im erwarteten Zeitfenster bestaetigt) - die Anzeige
+ *  muss diese Schwellenlogik dadurch nicht selbst nachbilden.
+ *
+ *  SET DEBUG=0-3 (persistent im NVS) steuert NUR NOCH zusaetzliche
+ *  Diagnosefelder, nicht mehr OB ueberhaupt etwas gesendet wird:
+ *    0 (Default): keine zusaetzlichen Diagnosefelder
+ *    3: zusaetzlich je Schuss eine Zeile PRO ausgewerteter Mic-Kombination
  *      ({"type":"cand",...}), mit deren Ergebnis (x_mm/y_mm, 2 Nachkomma-
  *      stellen) und den dafuer verwendeten Laufzeiten (t_ref_ns/t_a_ns/
- *      t_b_ns der beteiligten Mics ref/a/b) - siehe solveAirPosition().
+ *      t_b_ns der beteiligten Mics ref/a/b) - siehe solveAirPosition() -
+ *      sowie die Stufe-1-Werte vor dem Verifizierungsschritt (x_um_pre/
+ *      y_um_pre/precision_um_pre/cluster_hits_pre) im "shot"-Telegramm.
  *
  *  SET OUTLIER=<0.001mm> (persistent im NVS, Default 5000 = 5.0mm) legt
  *  die Schwelle fest, ab der ein Schuss als "Mikrofon-Ausreißer" gilt.
@@ -367,7 +394,7 @@
 // Konstanten & Werks-Defaults (greifen nur bei leerem NVS)
 // ---------------------------------------------------------------------------
 
-#define FW_VERSION   "4.5.1"
+#define FW_VERSION   "4.6.1"
 #define SERIAL_BAUD  115200
 #define NVS_NS       "schiessstd"     // NVS-Namespace
 
@@ -454,6 +481,10 @@ struct DeviceConfig {
                             // 3-MAX_CAL_SHOTS, Default 5)
     uint8_t  targetMode;    // TARGET_STEEL (Default) oder TARGET_PAPER,
                             // siehe applyTargetGeometry() (SET TARGET)
+    float    standoffSteelMm; // Mic-Standoff (rechtwinklig zur Platte) in mm
+                            // im STEEL-Modus (SET STANDOFFSTEEL, Default 30.0)
+    float    standoffPaperMm; // Wie standoffSteelMm, fuer PAPER-Modus
+                            // (SET STANDOFFPAPER, Default 28.0)
     bool     usePiezo;      // Piezo (Stahlplatte, PIEZO_PIN) als Trigger-
                             // Bestaetigung nutzen? (SET PIEZO, Default 1/an)
     uint32_t piezoMinUs;    // Erwartete min. Verzoegerung Piezo nach erstem
@@ -511,6 +542,8 @@ static void loadConfig()
     }
     cfg.calShotCount = prefs.getUChar("cal_n", 5);
     cfg.targetMode = prefs.getUChar("target", TARGET_STEEL);
+    cfg.standoffSteelMm = prefs.getFloat("standoff_st", 30.0f);
+    cfg.standoffPaperMm = prefs.getFloat("standoff_pa", 28.0f);
     cfg.usePiezo   = prefs.getBool("use_piezo", true);
     cfg.piezoMinUs = prefs.getUInt("piezo_min", 100);
     cfg.piezoMaxUs = prefs.getUInt("piezo_max", 1400);
@@ -542,6 +575,8 @@ template <> void saveVal<uint8_t>(const char *key, uint8_t v)
 { prefs.begin(NVS_NS, false); prefs.putUChar(key, v); prefs.end(); }
 template <> void saveVal<int32_t>(const char *key, int32_t v)
 { prefs.begin(NVS_NS, false); prefs.putInt(key, v); prefs.end(); }
+template <> void saveVal<float>(const char *key, float v)
+{ prefs.begin(NVS_NS, false); prefs.putFloat(key, v); prefs.end(); }
 
 // ---------------------------------------------------------------------------
 // Schusserfassung – Luftschall-Mikrofone (Multi-Edge-Capture)
@@ -805,7 +840,7 @@ static void sendShowConfig()
           "\"outlier_um\":%u,\"cluster_radius_um\":%u,\"min_cluster_hits\":%d,"
           "\"max_precision_um\":%u,\"min_mics\":%d,"
           "\"tdoa_us\":%u,\"mic_offset_ns\":[%s],\"mic_enabled\":[%s],\"cal_shots\":%d,"
-          "\"target\":\"%s\","
+          "\"target\":\"%s\",\"standoff_steel_mm\":%.2f,\"standoff_paper_mm\":%.2f,"
           "\"use_piezo\":%d,\"piezo_min_us\":%u,\"piezo_max_us\":%u,"
           "\"test_cooldown_ms\":%u,\"offset_x_um\":%ld,\"offset_y_um\":%ld,"
           "\"sound_mps\":%u,"
@@ -819,6 +854,7 @@ static void sendShowConfig()
           cfg.maxPrecisionUm, cfg.minMics,
           cfg.airMaxTdoaUs, ofsBuf, enBuf, cfg.calShotCount,
           cfg.targetMode == TARGET_PAPER ? "paper" : "steel",
+          cfg.standoffSteelMm, cfg.standoffPaperMm,
           cfg.usePiezo ? 1 : 0, cfg.piezoMinUs, cfg.piezoMaxUs,
           cfg.testCooldownMs, (long)cfg.offsetXUm, (long)cfg.offsetYUm,
           cfg.soundSpeedMps,
@@ -905,7 +941,7 @@ static float micStandoffMm = MIC_STANDOFF_STEEL;
 static void applyTargetGeometry()
 {
     const float halfY = (cfg.targetMode == TARGET_PAPER) ? MIC_HALF_Y_PAPER : MIC_HALF_Y_STEEL;
-    micStandoffMm      = (cfg.targetMode == TARGET_PAPER) ? MIC_STANDOFF_PAPER : MIC_STANDOFF_STEEL;
+    micStandoffMm      = (cfg.targetMode == TARGET_PAPER) ? cfg.standoffPaperMm : cfg.standoffSteelMm;
     MIC_Y[0] = -halfY; MIC_Y[1] = -halfY;
     MIC_Y[2] = +halfY; MIC_Y[3] = +halfY;
     MIC_Y[4] = 0.0f;   MIC_Y[5] = 0.0f;
@@ -1362,29 +1398,32 @@ static void processShot()
         }
     }
 
+    // Rev 4.6.1: shotCounter/sequenceNo werden jetzt IMMER erhoeht (auch bei
+    // einem Reject) - siehe Kommentar bei der Telegramm-Ausgabe weiter unten:
+    // JEDE Ausloesung soll bei der Anzeige unter einer fortlaufenden Sequenz-
+    // Nummer ankommen, auch wenn sie zu wenige Mics hatte.
+    shotCounter++;
+    sequenceNo++;
+
     if (airHits < cfg.minMics) {
-        if (cfg.debug >= 2) {
-            // piezo_ns mit ausgeben (auch hier, nicht nur bei "shot"): so
-            // laesst sich der Piezo isoliert testen (z.B. per Klopfen auf
-            // die Stahlplatte), ohne dass genug Luft-Mics fuer einen
-            // vollstaendigen "shot" ausloesen muessen - siehe SET PIEZO.
-            if (cfg.usePiezo && localPiezoSeen) {
-                emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
-                      "\"hits\":%d,\"piezo_ns\":%lld}\n",
-                      airHits, airHits, (long long)piezoT0NsRaw);
-            } else if (cfg.usePiezo) {
-                emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
-                      "\"hits\":%d,\"piezo_ns\":null}\n", airHits, airHits);
-            } else {
-                emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
-                      "\"hits\":%d}\n", airHits, airHits);
-            }
+        // Rev 4.6.1: nicht mehr an SET DEBUG gebunden - geht jetzt immer
+        // raus, damit bei der Anzeige zu jeder Sequenz-Nummer etwas ankommt
+        // (sonst wuerde ein "zu duenner" Schuss dort spurlos fehlen). SET
+        // DEBUG steuert nur noch die zusaetzlichen "cand"/"_pre"-Diagnose-
+        // felder (SET DEBUG=3), nicht mehr OB ueberhaupt etwas gesendet wird.
+        if (cfg.usePiezo && localPiezoSeen) {
+            emitf("{\"type\":\"reject\",\"seq\":%u,\"reason\":\"only %d mic(s)\","
+                  "\"hits\":%d,\"piezo_ns\":%lld}\n",
+                  sequenceNo, airHits, airHits, (long long)piezoT0NsRaw);
+        } else if (cfg.usePiezo) {
+            emitf("{\"type\":\"reject\",\"seq\":%u,\"reason\":\"only %d mic(s)\","
+                  "\"hits\":%d,\"piezo_ns\":null}\n", sequenceNo, airHits, airHits);
+        } else {
+            emitf("{\"type\":\"reject\",\"seq\":%u,\"reason\":\"only %d mic(s)\","
+                  "\"hits\":%d}\n", sequenceNo, airHits, airHits);
         }
         return;
     }
-
-    shotCounter++;
-    sequenceNo++;
 
     // Kalibrierten Timing-Offset je Mikrofon abziehen (SET OFS<i> bzw.
     // CAL START, Default 0) - siehe runCalibration().
@@ -1466,25 +1505,26 @@ static void processShot()
                           ",\"piezo_ns\":null,\"piezo_ok\":0");
         }
     }
-    snprintf(line + n, sizeof(line) - n, ",\"hits\":%d,\"ts\":%llu}\n",
-             airHits, (unsigned long long)(localFirstUs / 1000ULL));
-
-    // DEBUG=0 (Default): nur sauber ermittelte Schuesse (kein Ausreisser,
-    // Position bestimmbar, genug uebereinstimmende Mic-Kombinationen,
-    // precision_um innerhalb der Schwelle, und - falls SET PIEZO=1 - vom
-    // Piezo im erwarteten Zeitfenster bestaetigter Einschlag statt eines
-    // durch den Muendungsknall verfrueht geoeffneten Sammelfensters, siehe
-    // Rev-4.3-Hinweis oben) werden ausgegeben. DEBUG>=1: auch Schuesse mit
-    // Mikrofon-Ausreisser, nicht bestimmbarer Position oder fehlender/
-    // ausserhalb des Fensters liegender Piezo-Bestaetigung.
+    // "clean" fasst zusammen, ob der Schuss allen Qualitaetsschwellen
+    // genuegt (kein Ausreisser, Position bestimmbar, genug uebereinstimmende
+    // Mic-Kombinationen, precision_um innerhalb der Schwelle, und - falls
+    // SET PIEZO=1 - vom Piezo im erwarteten Zeitfenster bestaetigt) - damit
+    // muss die Anzeige diese Schwellenlogik nicht selbst nachbilden, um
+    // "gute" von "fragwuerdigen" Schuessen zu unterscheiden.
     bool isClean = posOk
                  && (unsigned long)resUm < cfg.airOutlierUm
                  && clusterN >= (int)cfg.minClusterHits
                  && (unsigned long)precUm <= cfg.maxPrecisionUm
                  && (!cfg.usePiezo || piezoOk);
-    if (isClean || cfg.debug >= 1) {
-        emitLine(line);
-    }
+    n += snprintf(line + n, sizeof(line) - n, ",\"clean\":%d", isClean ? 1 : 0);
+    snprintf(line + n, sizeof(line) - n, ",\"hits\":%d,\"ts\":%llu}\n",
+             airHits, (unsigned long long)(localFirstUs / 1000ULL));
+
+    // Rev 4.6.1: nicht mehr an isClean/SET DEBUG gebunden - geht jetzt IMMER
+    // raus (auch unsaubere/Ausreisser-Schuesse), damit bei der Anzeige zu
+    // jeder Sequenz-Nummer etwas ankommt. Die Anzeige kann "clean" (siehe
+    // oben) nutzen, um trotzdem nur saubere Treffer hervorzuheben/zu werten.
+    emitLine(line);
 }
 
 // ---------------------------------------------------------------------------
@@ -1505,8 +1545,10 @@ static void sendHelp()
         "#   SET LANE=<1-999>         Bahnnummer",
         "#   SET DEBOUNCE=<10-5000>   Sperrzeit nach Schuss in ms",
         "#   SET WINDOW=<1-50>        Sammelfenster in ms",
-        "#   SET DEBUG=<0-3>          Ausgabe-Filter: 0=nur saubere Schuesse,",
-        "#                            1=+Mikrofon-Ausreisser, 2=+Reject (wenig Hits),",
+        "#   SET DEBUG=<0-3>          shot/reject-Telegramme gehen seit Rev 4.6.1 IMMER",
+        "#                            raus (jede Sequenz-Nummer kommt bei der Anzeige an,",
+        "#                            das Feld \"clean\" markiert saubere Treffer). SET DEBUG",
+        "#                            steuert nur noch zusaetzliche Diagnosefelder:",
         "#                            3=+Kandidaten-Zeilen je Mic-Kombination (type=cand)",
         "#                            +Stufe-1-Werte vor dem Verifizierungsschritt",
         "#                            (x_um_pre/y_um_pre/precision_um_pre/cluster_hits_pre)",
@@ -1521,6 +1563,9 @@ static void sendHelp()
         "#   SET MINMICS=<3-6>        Mindestzahl Mics fuer gueltigen Schuss (Default 5)",
         "#   SET TDOA=<100-5000>      Geometrie-Plausibilitaetsfenster in us (Default 750)",
         "#   SET TARGET=<STEEL|PAPER> Messmodus/Mic-Geometrie (Default STEEL)",
+        "#   SET STANDOFFSTEEL=<5.0-100.0>  Mic-Standoff (rechtwinklig zur Platte)",
+        "#                            in mm, STEEL-Modus (Default 30.0)",
+        "#   SET STANDOFFPAPER=<5.0-100.0>  Wie STANDOFFSTEEL, PAPER-Modus (Default 28.0)",
         "#   SET PIEZO=<0|1>          Piezo (Stahlplatte, GPIO34) als Trigger-",
         "#                            Bestaetigung nutzen (Default 1/an)",
         "#   SET PIEZOMIN=<0-5000>    Min. erwartete Piezo-Verzoegerung in us",
@@ -1664,6 +1709,20 @@ static bool handleSet(const String &raw)
         applyTargetGeometry();
         emitf("{\"type\":\"ok\",\"set\":\"target\",\"value\":\"%s\"}\n",
               cfg.targetMode == TARGET_PAPER ? "paper" : "steel");
+    } else if (key == "STANDOFFSTEEL") {
+        float v = val.toFloat();
+        if (v < 5.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"standoffsteel 5.0-100.0\"}\n"); return true; }
+        cfg.standoffSteelMm = v;
+        saveVal<float>("standoff_st", cfg.standoffSteelMm);
+        applyTargetGeometry();
+        emitf("{\"type\":\"ok\",\"set\":\"standoffsteel\",\"value\":%.2f}\n", cfg.standoffSteelMm);
+    } else if (key == "STANDOFFPAPER") {
+        float v = val.toFloat();
+        if (v < 5.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"standoffpaper 5.0-100.0\"}\n"); return true; }
+        cfg.standoffPaperMm = v;
+        saveVal<float>("standoff_pa", cfg.standoffPaperMm);
+        applyTargetGeometry();
+        emitf("{\"type\":\"ok\",\"set\":\"standoffpaper\",\"value\":%.2f}\n", cfg.standoffPaperMm);
     } else if (key == "PIEZO") {
         long v = val.toInt();
         if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"piezo 0|1\"}\n"); return true; }

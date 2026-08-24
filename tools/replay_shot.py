@@ -144,8 +144,12 @@ def solve_position(t, seen, mic_x, mic_y, standoff, sound_mm_per_ns, cluster_rad
 
 
 def first_edges(air_ns, mic_offset_ns):
-    seen = [len(edges) > 0 for edges in air_ns]
-    t = [(edges[0] - mic_offset_ns[i]) if seen[i] else 0 for i, edges in enumerate(air_ns)]
+    # Seit Firmware Rev 4.9 ist air_ns ein FLACHES Array (ein Wert je Mikrofon,
+    # null = nicht erfasst), relativ zum Ausloeser (Piezo bzw. im PIEZO=0-
+    # Fallback die erste Luft-Flanke) statt einer Liste aller Rohkandidaten
+    # relativ zum ersten Mikrofon-Hit (Vor-4.9-Format).
+    seen = [v is not None for v in air_ns]
+    t = [(air_ns[i] - mic_offset_ns[i]) if seen[i] else 0 for i in range(len(air_ns))]
     return t, seen
 
 

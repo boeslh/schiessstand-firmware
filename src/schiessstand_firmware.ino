@@ -1,153 +1,8 @@
 /*
  * ============================================================================
  *  Elektronischer Schießstand – ESP32 Firmware
- *  Rev 4.9 – Komplettumbau der Schusserfassung auf einen kontinuierlich
- *            laufenden Ringpuffer je Mikrofon; Piezo ist jetzt der alleinige,
- *            EREIGNISGESTEUERTE Trigger (kein Polling/Timeout mehr)
- * ============================================================================
- *
- *  Hintergrund: Das bisherige Modell ("die erste erfasste Luft-Flanke
- *  oeffnet ein Sammelfenster, SET TDOA verwirft in der ISR alles, was zu
- *  weit vom schnellsten Mic dieses Fensters abweicht") hatte einen
- *  strukturellen Webfehler: WELCHES Ereignis das Fenster oeffnet, war reiner
- *  Zufall (oft der Muendungsknall statt des echten Einschlags) - alles, was
- *  VOR diesem Zufallsereignis lag, war unwiederbringlich verloren, noch
- *  bevor das Piezo ueberhaupt etwas dazu sagen konnte. Rev 4.5/4.6 haben das
- *  mit wachsendem Aufwand (PIEZOLEAD/PIEZOCONFIRM/immer laenger bemessene
- *  SET TDOA/PIEZOCONFIRM-Sammelfenster) kompensiert, ohne den Kernfehler zu
- *  beheben - und ein zu spaet oeffnendes bzw. zu frueh laufendes Zeitfenster
- *  fuehrte wiederholt zu "reject: only 0 mic(s)"-Ausfaellen.
- *
- *  Neu: Jedes Luft-Mikrofon zeichnet KONTINUIERLICH (unabhaengig von jedem
- *  Trigger) seine letzten Flanken in einen eigenen Ringpuffer auf
- *  (AIR_RING_SIZE=128 Slots, siehe airRing[]/airISR() weiter unten) - es
- *  gibt kein Fenster mehr, das durch ein beliebiges erstes Ereignis geoeffnet
- *  wird, und damit auch keine Geometrie-Plausibilitaetspruefung mehr in der
- *  ISR (SET TDOA/cfg.airMaxTdoaUs sind komplett entfallen).
- *
- *  Das Piezo (Koerperschall auf der Stahlplatte) ist jetzt der EINZIGE
- *  Ausloeser: Feuert es (SET PIEZO=1, siehe piezoISR()), wird nach einer
- *  kurzen Nachlaufzeit (TARGET=PAPER: SET PIEZOTRAIL, TARGET=STEEL: SET
- *  PIEZOMAX) sofort der Ringpuffer jedes Mikrofons ausgewertet - kein
- *  Polling/Timeout mehr wie bei SET PIEZOCONFIRM (Rev 4.6, komplett
- *  entfallen): loest das Piezo nicht aus (z.B. reiner Muendungsknall ohne
- *  Einschlag), passiert schlicht nichts - keine Sperrzeit, kein Reject-
- *  Telegramm, das System ist sofort wieder bereit.
- *
- *  TARGET=PAPER durchsucht den Ringpuffer RUECKWAERTS ab dem Piezo-Zeitpunkt
- *  (SET PIEZOLEAD/PIEZOLEADMIN, unveraendertes Konzept aus Rev 4.5, plus ein
- *  kleines Nachlauf-Fenster SET PIEZOTRAIL) - je Mikrofon wird weiterhin die
- *  zeitlich AM NAECHSTEN an Piezo liegende Flanke im erlaubten Bereich
- *  gewaehlt (Rev-4.5-Algorithmus, jetzt auf den Ringpuffer statt ein starres
- *  Capture-Array angewendet). TARGET=STEEL durchsucht dagegen VORWAERTS ab
- *  dem Piezo-Zeitpunkt (0..SET PIEZOMAX) - dort sitzt das Piezo direkt auf
- *  der Trefferflaeche und loest schneller aus als jeder Luftschall.
- *
- *  SET RINGBUFFER (Default 10ms, siehe cfg.ringBufferMs) begrenzt zusaetzlich
- *  grob, wie weit rueckwaerts ueberhaupt gesucht wird (deckelt SET PIEZOLEAD
- *  nach oben) - ein einfacher, unabhaengiger Parameter fuer "wie viel
- *  Vorgeschichte soll ueberhaupt betrachtet werden", getrennt von der
- *  feinen Auswahllogik.
- *
- *  Ist SET PIEZO=0 (kein Piezo verbaut): Fallback auf das urspruengliche
- *  Verhalten - die erste Luft-Flanke nach Ablauf der Sperrzeit ist der
- *  Trigger, danach wird SET WINDOW lang vorwaerts gesammelt (je Mikrofon die
- *  fruehste Flanke in diesem Fenster). SET WINDOW ist damit ausschliesslich
- *  fuer diesen Fallback-Fall relevant.
- *
- *  Entfallen (nicht mehr benoetigt): SET TDOA, SET PIEZOMIN (die "Verzoegerung
- *  relativ zum ersten Luft-Ereignis"-Pruefung ergibt keinen Sinn mehr, wenn
- *  das Piezo selbst der Zeit-Nullpunkt ist), SET PIEZOCONFIRM,
- *  shotInProgress/firstAirCC/das starre airCC[][]-Capture-Array. Die
- *  Telegrammfelder "piezo_ns"/"piezo_ok" entfallen ebenfalls (piezo_ns waere
- *  jetzt trivial immer 0, da Piezo selbst der Zeitbezug ist) - die
- *  Verzoegerung jedes Mikrofons relativ zu Piezo steht direkt und praeziser
- *  in air_ns. air_ns ist jetzt ein FLACHES Array (ein Wert je Mikrofon,
- *  null = nicht erfasst) statt einer Liste aller Rohkandidaten je Mikrofon -
- *  die frueher dafuer noetige manuelle Sichtung ist mit der jetzt robusten
- *  Piezo-Anker-Auswahl nicht mehr noetig (SET DEBUG=3 liefert bei Bedarf
- *  weiterhin die pro Mic-Kombination verwendeten Zeiten).
- * ============================================================================
- *
- *  Rev 4.7 – Automatische Schallgeschwindigkeits-Kalibrierung (Rev 4.4)
- *            wieder entfernt: CAL START kalibriert nur noch die Mic-Timing-
- *            Offsets, SET SOUNDSPEED ist wieder ein rein manueller Wert
- * ============================================================================
- *
- *  Hintergrund: Die in Rev 4.4 eingefuehrte automatische Schallgeschwindig-
- *  keits-Schaetzung (per Koordinatenabstieg auf precision_um ODER die in
- *  Rev "analytische Median-Schaetzung"-Variante) lieferte in der Praxis
- *  wiederholt schlechte/unplausible Ergebnisse - vermutlich weil die
- *  Kalibrier-Schuesse durch Mehrwege-/Nachhall-Effekte und die AIR4/AIR5-
- *  Hardwarethematik oft selbst nicht sauber genug sind, um zuverlaessig auf
- *  v zu schliessen (siehe Testmodus-Analysen). SET SOUNDSPEED/SET CALMODE
- *  als von CAL START mitkalibrierter Wert wurden deshalb wieder entfernt -
- *  SET SOUNDSPEED bleibt als manueller Parameter bestehen, siehe unten.
- * ============================================================================
- *
- *  Rev 4.6 – (HISTORISCH, per Rev 4.9 komplett durch den Ringpuffer-Umbau
- *            ersetzt - SET PIEZOCONFIRM/SET TDOA existieren nicht mehr,
- *            siehe Rev-4.9-Hinweis oben) Schnelles Verwerfen ohne Piezo-
- *            Bestaetigung (SET PIEZOCONFIRM, NUR TARGET=PAPER): kommt nach
- *            der ersten Luft-Flanke innerhalb PIEZOCONFIRM kein Piezo-
- *            Signal, wird der Ausloeser SOFORT verworfen (keine Sperrzeit)
- *            statt lange auf ein Piezo zu warten
- * ============================================================================
- *
- *  Hintergrund: Rev 4.5 (PIEZOLEAD) loeste zwar aus, WELCHE Luft-Flanke fuer
- *  die Trilateration verwendet wird - das Sammelfenster musste dafuer aber
- *  bis SET PIEZOMAX offen bleiben. In der Praxis kann das Piezo bei einem
- *  echten Muendungsknall-Fehltrigger aber viele ms (teils >30ms, siehe
- *  Testmodus-Messungen) oder gar nicht kommen - ein so lang bemessenes
- *  PIEZOMAX wuerde jeden Fehltrigger minutenlang "totlaufen" lassen, bevor
- *  der naechste (echte) Schuss ueberhaupt erkannt werden kann.
- *
- *  Neu (NUR TARGET=PAPER, NUR bei aktivem Piezo): Das Sammelfenster bleibt
- *  kurz (SET PIEZOCONFIRM, Default 5000us=5ms). Ist bis dahin KEIN Piezo
- *  erfasst, wird der Ausloeser in loop() SOFORT verworfen (resetShotState(),
- *  kein processShot(), keine Sperrzeit - lockoutUntil wird nur in
- *  processShot() gesetzt) - das System ist dadurch ohne jede Pause wieder
- *  fuer den naechsten Ausloeser bereit. Kommt Piezo dagegen rechtzeitig, wird
- *  wie gewohnt verarbeitet (inkl. PIEZOLEAD-Flankenauswahl aus Rev 4.5).
- *
- *  PIEZOMAX (Rev 4.3) ist damit fuer TARGET=PAPER nicht mehr relevant -
- *  PIEZOCONFIRM uebernimmt dort dessen bisherige Rolle beim Bemessen des
- *  Sammelfensters; PIEZOMAX bleibt ausschliesslich fuer TARGET=STEEL aktiv
- *  (dort kommt das Piezo planmaessig VOR/gleichzeitig mit den Mics, ein
- *  Verwerfen mangels Piezo-Bestaetigung ergibt dort keinen Sinn).
- *
- *  WICHTIG: SET TDOA muss weiterhin mindestens SET PIEZOCONFIRM abdecken,
- *  sonst verwirft airISR() die fuer PIEZOLEAD benoetigten Flanken schon,
- *  bevor processShot() sie auswerten kann.
- * ============================================================================
- *
- *  Hintergrund: Empfindlicher eingestellte Mikrofone (fuer weniger Jitter/
- *  praezisere Flankenerkennung) fangen leichter auch Fremdgeraeusche ein -
- *  eigener Muendungsknall, aber auch Schuesse von benachbarten Staenden.
- *  Bisher (Rev 4.3) wurde das nur NACHTRAEGLICH per PIEZOMIN/PIEZOMAX
- *  erkannt (Schuss wird als nicht "sauber" markiert), die Positions-
- *  berechnung selbst nutzte aber weiterhin blind airCC[i][0] (erste
- *  erfasste Flanke) - bei einer fremden, frueher eintreffenden Flanke also
- *  eine von vornherein falsche Grundlage.
- *
- *  Neu (NUR TARGET=PAPER, NUR bei aktivem Piezo, SET PIEZOLEAD, Default
- *  2000us=2ms): Fuer jedes Mikrofon wird jetzt aus dessen Multi-Edge-Capture-
- *  Liste (bis zu 6 Flanken) gezielt diejenige gewaehlt, die hoechstens
- *  PIEZOLEAD vor der Piezo-Ausloesung liegt - der erwartete Bereich fuer den
- *  echten Einschlag (Papier-Durchschlag kurz vor dem Stahl-Kontakt, siehe
- *  Rev-4.3-Hinweis unten). Frueher eingetroffene Flanken (Muendungsknall,
- *  Nachbarstaende) werden dabei ignoriert, auch wenn sie als airCC[i][0]
- *  erfasst wurden. Findet sich fuer ein Mikrofon keine Flanke in diesem
- *  Fenster, gilt es fuer diesen Schuss als nicht erfasst.
- *
- *  WICHTIG: SET TDOA (Geometrie-Plausibilitaetsfenster in airISR(), Default
- *  750us) muss dafuer grosszuegig genug sein (mindestens PIEZOMAX +
- *  PIEZOLEAD) - sonst verwirft airISR() die benoetigten spaeten Flanken
- *  schon, bevor sie ueberhaupt in processShot() ankommen.
- *
- *  STEEL ist bewusst ausgenommen (dort loest das Piezo VOR oder gleichzeitig
- *  mit den Luftmikrofonen aus, siehe Rev-4.3-Hinweis unten - ein "davor"-
- *  Fenster ergibt dort keinen Sinn); dort bleibt es bei airCC[i][0].
+ *  Rev 4.4 – Schallgeschwindigkeit (SET SOUNDSPEED, Default 355 m/s) laufzeit-
+ *            konfigurierbar und wird von CAL START automatisch mitkalibriert
  * ============================================================================
  *
  *  Neu in 4.4: SOUND_MM_PER_NS ist keine feste Konstante mehr, sondern
@@ -157,11 +12,10 @@
  *  werden zu nah am Zentrum berechnet) ist ein typisches Anzeichen fuer eine
  *  zu NIEDRIG angenommene Schallgeschwindigkeit.
  *
- *  CAL START kalibrierte ab dieser Revision zusaetzlich zu den Mic-Offsets
- *  versuchsweise auch automatisch die Schallgeschwindigkeit mit - das wurde
- *  in Rev 4.7 wegen unzuverlaessiger Ergebnisse wieder entfernt (siehe
- *  Rev-4.7-Hinweis ganz oben). SET SOUNDSPEED bleibt als manueller Parameter
- *  bestehen, nur eben nicht mehr automatisch mitkalibriert.
+ *  CAL START (siehe unten) kalibriert seit dieser Revision zusaetzlich zu
+ *  den Mic-Offsets automatisch auch die Schallgeschwindigkeit mit, optimiert
+ *  auf precision_um (nicht auf den sonst genutzten pos_res_um-Rest-Fehler -
+ *  siehe Kommentar bei calCost()/runCalibration() fuer die Begruendung).
  * ============================================================================
  *
  *  Rev 4.3 – Piezo-Trigger-Bestaetigung (SET PIEZO) zur Erkennung von
@@ -195,21 +49,31 @@
  *
  *  Das Piezo sitzt in der Stahlplatte und spricht nur auf echten
  *  Koerperschall (Projektil-Einschlag) an, nicht auf Luftschall - damit ist
- *  es unempfindlich gegen den Muendungsknall und dient seit Rev 4.9 als
- *  alleiniger, ereignisgesteuerter Ausloeser der Schusserfassung (siehe
- *  Rev-4.9-Hinweis ganz oben und piezoISR()/loop()/processShot() weiter
- *  unten). SET PIEZO=0 deaktiviert das Piezo komplett - dann uebernimmt die
- *  erste Luft-Flanke nach Ablauf der Sperrzeit die Trigger-Rolle (Default 1/an).
+ *  es unempfindlich gegen den Muendungsknall. Es loest rechnerisch
+ *  SET PIEZOMIN..SET PIEZOMAX (Default 100..1400 us) NACH dem ersten
+ *  Luft-Ereignis aus (Flugzeit des Projektils vom Einschlagpunkt zur
+ *  8-18cm dahinterliegenden Stahlplatte bei ~150 m/s). Faellt die
+ *  gemessene Piezo-Verzoegerung ausserhalb dieses Fensters (oder das Piezo
+ *  loest gar nicht aus), hat vermutlich der Muendungsknall statt des
+ *  echten Einschlags das Sammelfenster geoeffnet - der Schuss gilt dann
+ *  NICHT mehr automatisch als sauber (siehe isClean in processShot()),
+ *  wird bei SET DEBUG>=1 aber weiterhin mit "piezo_ns"/"piezo_ok" zur
+ *  Diagnose ausgegeben. SET PIEZO=0 deaktiviert die Pruefung wieder
+ *  komplett (Default 1/an).
+ *
+ *  Das Sammelfenster (SET WINDOW) wird bei aktivem Piezo automatisch auf
+ *  mindestens SET PIEZOMAX + Sicherheitsmarge verlaengert, damit das
+ *  Piezo-Ereignis nicht verpasst wird (siehe loop()).
  *
  *  WICHTIG - TARGET=STEEL unterscheidet sich hier grundlegend von PAPER:
  *  Im STEEL-Modus IST die Stahlplatte die Trefferflaeche, das Piezo sitzt
  *  also direkt darauf und erkennt den Einschlag quasi latenzfrei per
  *  Kontaktschall - schneller als die Luftschall-Laufzeit zu JEDEM Mikrofon.
- *  Nach dem Ausloesen wird daher VORWAERTS (0..SET PIEZOMAX) im Ringpuffer
- *  gesucht. TARGET=PAPER: das Geschoss durchquert erst noch die Papier-
- *  Stahl-Luecke, das Piezo loest also SPAETER aus als der Luftschall-Treffer
- *  am Papier - hier wird RUECKWAERTS gesucht (SET PIEZOLEAD/PIEZOLEADMIN,
- *  plus ein kleines Nachlauf-Fenster SET PIEZOTRAIL).
+ *  Es loest daher nahe t=0 aus (oft sogar exakt 0, wenn es selbst das
+ *  Sammelfenster oeffnet), statt wie im PAPER-Modus SPAETER als der erste
+ *  Luft-Treffer. SET PIEZOMIN wird deshalb im STEEL-Modus NICHT geprueft
+ *  (siehe processShot()), SET PIEZOMAX bleibt als Ausreisser-Obergrenze in
+ *  beiden Modi aktiv.
  * ============================================================================
  *
  *  Die Messung über das Stahlblech (Körperschall-Sensoren + MCPWM-Hardware-
@@ -218,14 +82,19 @@
  *  über Mikrofone (Piezo/Elektret) in der Seitenwand, die den Luftschall des
  *  Einschlags per TDOA (Time-Difference-of-Arrival) auswerten.
  *
- *  Ablauf (seit Rev 4.9): Jedes Mikrofon zeichnet fortlaufend, unabhaengig
- *  von jedem Trigger, seine Flanken in einen eigenen Ringpuffer auf
- *  (AIR_RING_SIZE Slots je Kanal, blendet per 20us-Totzeit weiterhin
- *  Nachschwinger/Echos direkt am selben Kanal aus). Ausgewertet wird erst,
- *  wenn das Piezo (oder im SET PIEZO=0-Fallback die erste Luft-Flanke)
- *  ausloest - siehe Rev-4.9-Hinweis oben fuer Details der Fenster-/
- *  Auswahllogik. Gültig ab SET MINMICS Mikrofonen von 6 (Default 5, siehe
- *  cfg.minMics).
+ *  Ablauf: Das erste erfasste Mikrofon öffnet das Sammelfenster (SET WINDOW,
+ *  Default 1 ms – knapp über SET TDOA). Innerhalb dieses Fensters
+ *  werden pro Mikrofon bis zu 6 Flanken erfasst (Multi-Edge-Capture, blendet
+ *  Nachschwinger/Echos aus).
+ *  Gültig ab SET MINMICS Mikrofonen von 6 (Default 5, siehe cfg.minMics).
+ *
+ *  Geometrie-Plausibilitaetsfilter: Aufgrund des Mikrofonabstands kann die
+ *  Laufzeitdifferenz zwischen zwei Mikrofonen fuer denselben Einschlag
+ *  SET TDOA (Default 750 us, siehe cfg.airMaxTdoaUs) nicht überschreiten.
+ *  Flanken, die spaeter als das schnellste Mikrofon dieses Schusses
+ *  eintreffen, werden daher schon in der ISR verworfen (airISR) - reduziert
+ *  sowohl die Flanken-Kombinationen in solveAirPosition() als auch die
+ *  Telegrammgroesse.
  *
  *  Pinbelegung Luft-Mikrofone (LM339-Frontend), je 3 pro Seitenwand:
  *    GPIO25 = links unten     GPIO26 = rechts unten
@@ -233,13 +102,11 @@
  *    GPIO32 = links mitte     GPIO33 = rechts mitte
  *
  *  Telegramm:
- *    {"type":"shot","seq":8,"air_ns":[-4200,-4150,null,-4300,-4100,-4250],
+ *    {"type":"shot","seq":8,"air_ns":[[0,...],[...],[...],[...],[...],[...]],
  *     "x_um":-22300,"y_um":-300,"pos_res_um":43910,"precision_um":120,
  *     "cluster_hits":3,"pos_valid":1,"hits":4,"ts":123456789}
- *    air_ns[i] = die fuer Mikrofon i AUSGEWAEHLTE Flanke (siehe Rev-4.9-
- *    Hinweis oben), in ns relativ zum Ausloeser (Piezo bzw. im SET PIEZO=0-
- *    Fallback die erste Luft-Flanke). null = kein passender Treffer fuer
- *    dieses Mikrofon gefunden.
+ *    air_ns[i] = Liste ALLER erfassten Flanken von Mikrofon i, in ns
+ *    relativ zum ersten erfassten Mikrofon. Leere Liste = keine Flanke.
  *
  *  Trefferposition (x_um/y_um, 1 Einheit = 0.001 mm) wird per Hyperbel-
  *  Trilateration aus den ersten Flanken der Mikrofone berechnet. Ursprung
@@ -321,27 +188,17 @@
  *  Konfiguration / Befehle: SET ... (NVS-persistent), SHOW, STATUS, PING,
  *  RESET, REBOOT, FACTORY, HELP/?
  *
- *  Kalibrierung (Timing-Offset je Mikrofon, SET OFS0..OFS5 in ns): CAL START
- *  sammelt die naechsten SET CALSHOTS (Default 5) gueltigen Schuesse an
- *  BELIEBIGEN, vorher nicht festgelegten Stellen der Scheibe und berechnet
- *  daraus per Koordinatenabstieg automatisch einen Timing-Offset je
- *  Mikrofon (keine Benutzerinteraktion noetig), der direkt persistiert und
- *  ab dem naechsten Schuss angewendet wird. Kompensiert werden damit
- *  systematische Laufzeitunterschiede der Kanaele (Komparator-Schwelle,
- *  Kabellaenge) - keine 3D-Neuvermessung der Mic-Positionen (siehe
- *  runCalibration() fuer die Begruendung). SET SOUNDSPEED wird bewusst NICHT
- *  mitkalibriert (siehe Kommentar bei calCost() weiter unten - automatische
- *  Schallgeschwindigkeits-Schaetzung lieferte in der Praxis unzuverlaessige
- *  Ergebnisse). Nach den Offsets gibt CAL START zusaetzlich (Rev 4.11) je
- *  gesammeltem Schuss eine "calshot"-Zeile mit den ROHEN Mikrofon-Messwerten
- *  aus (dasselbe air_ns-Format wie ein normales "shot"-Telegramm, siehe
- *  sendCalRawDump()) - damit steht am Ende immer eine vollstaendige,
- *  wiederverwendbare Kopie der Kalibrier-Rohdaten bereit (z.B. fuer
- *  tools/calibrate_mics.py oder um spaeter mit anderen Annahmen offline
- *  nachzurechnen, ohne erneut schiessen zu muessen). Die Mikrofonwerte sind
- *  bereits relativ zu Piezo (bzw. im SET PIEZO=0-Fallback zur ausloesenden
- *  Luft-Flanke) - ein separater Piezo-Messwert waere hier immer 0 und daher
- *  nicht informativ. CAL ABORT bricht ab, CAL STATUS
+ *  Kalibrierung (Timing-Offset je Mikrofon, SET OFS0..OFS5 in ns, UND seit
+ *  Rev 4.4 die Schallgeschwindigkeit SET SOUNDSPEED): CAL START sammelt die
+ *  naechsten SET CALSHOTS (Default 5) gueltigen Schuesse an BELIEBIGEN,
+ *  vorher nicht festgelegten Stellen der Scheibe und berechnet daraus per
+ *  Koordinatenabstieg automatisch sowohl einen Timing-Offset je Mikrofon als
+ *  auch die Schallgeschwindigkeit (keine Benutzerinteraktion noetig), die
+ *  direkt persistiert und ab dem naechsten Schuss angewendet werden.
+ *  Kompensiert werden damit systematische Laufzeitunterschiede der Kanaele
+ *  (Komparator-Schwelle, Kabellaenge) sowie eine falsch angenommene
+ *  Schallgeschwindigkeit - keine 3D-Neuvermessung der Mic-Positionen (siehe
+ *  runCalibration() fuer die Begruendung). CAL ABORT bricht ab, CAL STATUS
  *  zeigt den Fortschritt, CAL RESET setzt alle Offsets auf 0 und die
  *  Schallgeschwindigkeit auf den Default (355 m/s) zurueck.
  *
@@ -360,37 +217,16 @@
 // Konstanten & Werks-Defaults (greifen nur bei leerem NVS)
 // ---------------------------------------------------------------------------
 
-#define FW_VERSION   "4.11.0"
+#define FW_VERSION   "4.4.1"
 #define SERIAL_BAUD  115200
 #define NVS_NS       "schiessstd"     // NVS-Namespace
 
 // Luft-Mikrofone: LM339-Frontend, 3 pro Seitenwand (links/rechts)
 #define NUM_AIR        6
-#define AIR_RING_SIZE  128 // Rev 4.9: Groesse des kontinuierlich laufenden
-                            // Ringpuffers je Mikrofon (siehe airRing[] weiter
-                            // unten) - unabhaengig von jedem Trigger immer
-                            // aktiv, aeltere Flanken werden beim Vollwerden
-                            // einfach ueberschrieben. 128 Slots decken selbst
-                            // bei dichtem Nachhall (siehe Testmodus-Messungen:
-                            // teils <1ms zwischen Flanken je Kanal) deutlich
-                            // mehr als die per SET RINGBUFFER/PIEZOLEAD
-                            // gesuchte Vorgeschichte ab.
+#define AIR_MAX_EDGES  6
 // Reihenfolge: 0=links unten 1=rechts unten 2=links oben 3=rechts oben
 //              4=links mitte 5=rechts mitte  (siehe MIC_X/MIC_Y weiter unten)
 static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 32, 33};
-
-// Rev 4.9: Explizite Vorab-Deklarationen fuer processShot() und seine
-// Ringpuffer-Helfer (siehe weiter unten fuer die eigentlichen Definitionen).
-// Der ctags-basierte Arduino-Prototyp-Generator erzeugt fuer processShot()
-// sonst einen fehlerhaften, an falscher Stelle eingefuegten Prototyp
-// (beobachteter Build-Fehler "processShot declared void" mitten in
-// loadConfig()) - eine eigene, frueh im File stehende Deklaration umgeht das.
-enum TriggerSource { TRIG_PIEZO, TRIG_FALLBACK_AIR };
-static bool ringFindEdge(const uint32_t ring[AIR_RING_SIZE], uint16_t head,
-                          uint32_t count, uint32_t refCC,
-                          int64_t loNs, int64_t hiNs,
-                          int64_t exLoNs, int64_t exHiNs, int64_t *outNs);
-static void processShot(TriggerSource src, uint32_t refCC, uint64_t refUs);
 
 // Optionales Piezo-Kontaktmikrofon (Koerperschall) auf der Stahlplatte,
 // dient als Trigger-Bestaetigung gegen verfrueh durch den Muendungsknall
@@ -404,6 +240,14 @@ static void processShot(TriggerSource src, uint32_t refCC, uint64_t refUs);
 // Stahlblech (Abprallflaeche) oder Papierscheibe (Durchschlag).
 #define TARGET_STEEL  0
 #define TARGET_PAPER  1
+
+// Geometriebedingt kann die Laufzeitdifferenz zwischen zwei Mikrofonen fuer
+// denselben Einschlag eine gewisse Schwelle nicht ueberschreiten. Flanken,
+// die spaeter als das schnellste Mikrofon dieses Schusses eintreffen, sind
+// daher garantiert kein Direktschall (Echo/Nachschwinger) und werden schon
+// in der ISR verworfen - reduziert sowohl die Zahl der Flanken-Kombinationen
+// in solveAirPosition() als auch die Telegrammgroesse. Laufzeitkonfigurierbar
+// per SET TDOA (Default 750 us, siehe cfg.airMaxTdoaUs).
 
 struct DeviceConfig {
     String   ssid;          // "" = WLAN deaktiviert
@@ -426,65 +270,23 @@ struct DeviceConfig {
                             // (SET MAXPRECISION, Default 2000 = 2.0mm)
     uint8_t  minMics;       // Mindestzahl Mics fuer eine gueltige Auswertung
                             // (SET MINMICS, 3-NUM_AIR, Default 5)
-    uint32_t ringBufferMs;  // Rev 4.9: wie weit rueckwaerts der kontinuier-
-                            // lich laufende Ringpuffer je Mikrofon bei der
-                            // Piezo-Anker-Auswahl hoechstens durchsucht wird
-                            // (SET RINGBUFFER, Default 10ms) - deckelt SET
-                            // PIEZOLEAD grob nach oben, siehe processShot()
+    uint32_t airMaxTdoaUs;  // Geometrie-Plausibilitaetsfenster in us
+                            // (SET TDOA, Default 750)
     int32_t  micOffsetNs[NUM_AIR]; // Timing-Offset je Mikrofon in ns, per
                             // Kalibrierung (CAL START) ermittelt oder
                             // manuell per SET OFS0..OFS<NUM_AIR-1>
-    int32_t  micPosOffsetXUm[NUM_AIR]; // Rev 4.9: Montage-Justage je Mikrofon
-    int32_t  micPosOffsetYUm[NUM_AIR]; // in 0.001mm, relativ zur Nominal-
-    int32_t  micPosOffsetZUm[NUM_AIR]; // Geometrie (SET MPOSX/MPOSY/MPOSZ<i>,
-                            // Default 0) - siehe applyTargetGeometry(). Z ist
-                            // die Standoff-Richtung (rechtwinklig zur Platte/
-                            // Scheibe). Offline per tools/calibrate_mics.py
-                            // ermittelt (Grid-Search ueber Position+Speed),
-                            // nicht durch CAL START (siehe dortige Kommentare)
     uint8_t  calShotCount;  // Anzahl Kalibrier-Schuesse (SET CALSHOTS,
                             // 3-MAX_CAL_SHOTS, Default 5)
     uint8_t  targetMode;    // TARGET_STEEL (Default) oder TARGET_PAPER,
                             // siehe applyTargetGeometry() (SET TARGET)
-    float    standoffSteelMm; // Mic-Standoff (rechtwinklig zur Platte) in mm
-                            // im STEEL-Modus (SET STANDOFFSTEEL, Default 30.0)
-    float    standoffPaperMm; // Wie standoffSteelMm, fuer PAPER-Modus
-                            // (SET STANDOFFPAPER, Default 28.0)
-    bool     usePiezo;      // Piezo (Stahlplatte, PIEZO_PIN) als alleiniger
-                            // Ausloeser der Schusserfassung nutzen? (SET
-                            // PIEZO, Default 1/an) - 0: Fallback auf die
-                            // erste Luft-Flanke als Ausloeser, siehe loop()
-    uint32_t piezoMaxUs;    // NUR TARGET=STEEL: wie lange nach dem Piezo-
-                            // Ausloesen gewartet wird, bevor der Ringpuffer
-                            // vorwaerts ausgewertet wird (SET PIEZOMAX,
-                            // Default 1400us) - dort sitzt das Piezo direkt
-                            // auf der Trefferflaeche und loest VOR den
-                            // Luftmikrofonen aus, siehe processShot()
-    uint32_t piezoLeadMaxUs; // NUR TARGET=PAPER, NUR bei aktivem Piezo: wie
-                            // weit VOR der Piezo-Ausloesung eine Luft-Flanke
-                            // je Mikrofon hoechstens liegen darf, um fuer die
-                            // Trilateration verwendet zu werden (SET
-                            // PIEZOLEAD, Default 2000us=2ms) - macht das
-                            // Piezo zum zentralen Anker-Element gegen
-                            // Fremdgeraeusche (Muendungsknall, Nachbarstaende),
-                            // siehe processShot()
-    uint32_t piezoTrailMaxUs; // NUR TARGET=PAPER: wie piezoLeadMaxUs, aber
-                            // wie weit eine Luft-Flanke NACH der Piezo-
-                            // Ausloesung noch liegen darf (SET PIEZOTRAIL,
-                            // Default 1000us=1ms) - das echte Treffer-Cluster
-                            // streut leicht UM das Piezo herum, nicht nur
-                            // davor. Bestimmt zugleich, wie lange in loop()
-                            // nach dem Ausloesen gewartet wird, bevor
-                            // ausgewertet wird (Nachlauf-Flanken muessen erst
-                            // im Ringpuffer ankommen)
-    uint32_t piezoLeadMinUs; // Untergrenze zu piezoLeadMaxUs (SET PIEZOLEADMIN,
-                            // Default 0=kein Ausschluss): Luft-Flanken, die
-                            // WENIGER als piezoLeadMinUs vor der Piezo-
-                            // Ausloesung liegen, werden ignoriert - damit
-                            // laesst sich gezielt ein Bereich DIREKT vor
-                            // Piezo ausschliessen (z.B. Muendungsknall-Reste),
-                            // waehrend ein Bereich weiter davor (bis
-                            // piezoLeadMaxUs) weiter zulaessig bleibt
+    bool     usePiezo;      // Piezo (Stahlplatte, PIEZO_PIN) als Trigger-
+                            // Bestaetigung nutzen? (SET PIEZO, Default 1/an)
+    uint32_t piezoMinUs;    // Erwartete min. Verzoegerung Piezo nach erstem
+                            // Luftschall-Ereignis in us (SET PIEZOMIN, Default 100)
+                            // - gilt NUR im TARGET=PAPER-Modus, siehe processShot()
+    uint32_t piezoMaxUs;    // Erwartete max. Verzoegerung Piezo nach erstem
+                            // Luftschall-Ereignis in us (SET PIEZOMAX, Default 1400)
+                            // - Ausreisser-Obergrenze fuer STEEL UND PAPER
     uint32_t testCooldownMs; // Min. Abstand zwischen 2 Meldungen desselben
                             // Sensors im Testmodus, in ms (SET TESTCOOLDOWN,
                             // Default 3000) - siehe testModeHit()
@@ -494,10 +296,9 @@ struct DeviceConfig {
                             // Default 0) - wird erst NACH der Trilateration
                             // addiert, siehe processShot()
     uint16_t soundSpeedMps; // Angenommene Schallgeschwindigkeit in m/s
-                            // (SET SOUNDSPEED, Default 355) - siehe
-                            // applySoundSpeed(). Rein manueller Parameter,
-                            // wird NICHT von CAL START mitkalibriert (siehe
-                            // Kommentar bei calCost()/runCalibration())
+                            // (SET SOUNDSPEED, Default 355, wird auch von
+                            // CAL START mitkalibriert) - siehe
+                            // applySoundSpeed()
     // Netzwerk: statische IP (staticIP=false → DHCP)
     bool     staticIP;
     String   ip;
@@ -525,27 +326,17 @@ static void loadConfig()
     cfg.minClusterHits = prefs.getUChar("min_clust", 2);
     cfg.maxPrecisionUm = prefs.getUInt("max_prec", 2000);  // Default 2.0 mm
     cfg.minMics    = prefs.getUChar("min_mics", 5);
-    cfg.ringBufferMs = prefs.getUInt("ring_ms", 10);
+    cfg.airMaxTdoaUs = prefs.getUInt("tdoa_us", 750);
     for (int i = 0; i < NUM_AIR; i++) {
         char key[8];
         snprintf(key, sizeof(key), "ofs%d", i);
         cfg.micOffsetNs[i] = prefs.getInt(key, 0);
-        snprintf(key, sizeof(key), "mpx%d", i);
-        cfg.micPosOffsetXUm[i] = prefs.getInt(key, 0);
-        snprintf(key, sizeof(key), "mpy%d", i);
-        cfg.micPosOffsetYUm[i] = prefs.getInt(key, 0);
-        snprintf(key, sizeof(key), "mpz%d", i);
-        cfg.micPosOffsetZUm[i] = prefs.getInt(key, 0);
     }
     cfg.calShotCount = prefs.getUChar("cal_n", 5);
     cfg.targetMode = prefs.getUChar("target", TARGET_STEEL);
-    cfg.standoffSteelMm = prefs.getFloat("standoff_st", 30.0f);
-    cfg.standoffPaperMm = prefs.getFloat("standoff_pa", 28.0f);
     cfg.usePiezo   = prefs.getBool("use_piezo", true);
+    cfg.piezoMinUs = prefs.getUInt("piezo_min", 100);
     cfg.piezoMaxUs = prefs.getUInt("piezo_max", 1400);
-    cfg.piezoLeadMaxUs = prefs.getUInt("piezo_lead", 2000);
-    cfg.piezoTrailMaxUs = prefs.getUInt("piezo_trail", 1000);
-    cfg.piezoLeadMinUs = prefs.getUInt("piezo_leadmin", 0);
     cfg.testCooldownMs = prefs.getUInt("test_cd_ms", 3000);
     cfg.offsetXUm = prefs.getInt("ofs_x_um", 0);
     cfg.offsetYUm = prefs.getInt("ofs_y_um", 0);
@@ -574,14 +365,14 @@ template <> void saveVal<uint8_t>(const char *key, uint8_t v)
 { prefs.begin(NVS_NS, false); prefs.putUChar(key, v); prefs.end(); }
 template <> void saveVal<int32_t>(const char *key, int32_t v)
 { prefs.begin(NVS_NS, false); prefs.putInt(key, v); prefs.end(); }
-template <> void saveVal<float>(const char *key, float v)
-{ prefs.begin(NVS_NS, false); prefs.putFloat(key, v); prefs.end(); }
 
 // ---------------------------------------------------------------------------
 // Schusserfassung – Luftschall-Mikrofone (Multi-Edge-Capture)
 // ---------------------------------------------------------------------------
 
-// Grobzeit (esp_timer) fuer Sperrzeit nach einem verarbeiteten Ausloeser
+// Grobzeit (esp_timer) fuer Fensterlogik und Sperrzeit
+static volatile uint64_t firstHitTimeUs = 0;
+static volatile bool     shotInProgress = false;
 static volatile uint64_t lockoutUntil = 0;
 
 static uint32_t shotCounter = 0;
@@ -598,22 +389,12 @@ static uint8_t calCollected = 0;
 static int64_t calRawNs[MAX_CAL_SHOTS][NUM_AIR];
 static bool    calSeenBuf[MAX_CAL_SHOTS][NUM_AIR];
 
-// Ringpuffer je Luftkanal (Rev 4.9): laeuft KONTINUIERLICH, unabhaengig von
-// jedem Trigger - airRingHead[i] ist der naechste Schreib-Index (wrapt bei
-// AIR_RING_SIZE), airRingCount[i] die Gesamtzahl je Kanal seit dem Boot
-// (fuer die Auswertung auf min(airRingCount[i], AIR_RING_SIZE) begrenzt,
-// siehe ringFindEdge()). airLastCC[i] dient weiterhin nur der 20us-Totzeit.
-static volatile uint32_t airRing[NUM_AIR][AIR_RING_SIZE];
-static volatile uint16_t airRingHead[NUM_AIR]  = {0};
-static volatile uint32_t airRingCount[NUM_AIR] = {0};
-static volatile uint32_t airLastCC[NUM_AIR]    = {0};
-
-// Rev 4.9: Fallback-Trigger fuer SET PIEZO=0 (kein Piezo verbaut) - die
-// erste Luft-Flanke nach Ablauf der Sperrzeit loest die Auswertung aus,
-// analog zum urspruenglichen "erste Flanke oeffnet Fenster"-Verhalten.
-static volatile bool     airTrigPending   = false;
-static volatile uint32_t airTrigPendingCC = 0;
-static volatile uint64_t airTrigPendingUs = 0;
+// Multi-Edge-Capture der Luftkanaele
+static volatile uint32_t airCC[NUM_AIR][AIR_MAX_EDGES];
+static volatile uint8_t  airCount[NUM_AIR] = {0};
+static volatile uint32_t airLastCC[NUM_AIR] = {0};
+static volatile uint32_t firstAirCC = 0;   // CPU-Zyklen, Fenster-Nullpunkt
+                                            // (erste Mikrofon-Flanke)
 
 // ---------------------------------------------------------------------------
 // Reiner Sensor-Testmodus (SET TESTMODE) - Kommissionierung/Hardware-Test:
@@ -664,61 +445,70 @@ void IRAM_ATTR airISR(void *arg)
     const uint64_t nowUs = (uint64_t)esp_timer_get_time();
     if (testMode) { testModeHit((uint8_t)idx, nowUs); return; }
 
-    const uint32_t cc = esp_cpu_get_cycle_count();
+    const uint32_t cc  = esp_cpu_get_cycle_count();
+
+    // Die erste Mikrofon-Flanke oeffnet das Sammelfenster selbst.
+    if (nowUs < lockoutUntil) return;
+    if (!shotInProgress) {
+        shotInProgress = true;
+        firstAirCC     = cc;
+        firstHitTimeUs = nowUs;
+    }
+
+    // Geometrie-Plausibilitaet: > cfg.airMaxTdoaUs nach dem schnellsten Mic
+    // kann physikalisch kein Direktschall desselben Einschlags mehr sein.
+    uint32_t dSinceFirst = cc - firstAirCC;          // wrap-sicher
+    if (dSinceFirst > cfg.airMaxTdoaUs * cpuMHz) return;
+
+    uint8_t n = airCount[idx];
+    if (n >= AIR_MAX_EDGES) return;
 
     // Totzeit 20 µs zwischen Flanken desselben Kanals: blendet das
-    // Eigenschwingen der Piezo-Resonanz (~4,4 kHz) nach jeder Flanke aus.
-    // Gilt IMMER, unabhaengig vom Trigger-Zustand - der Ringpuffer laeuft
-    // kontinuierlich (siehe Rev-4.9-Hinweis ganz oben).
-    if (airRingCount[idx] > 0) {
+    // Eigenschwingen der Piezo-Resonanz (~4,4 kHz) nach jeder Flanke aus
+    if (n > 0) {
         uint32_t dCC = cc - airLastCC[idx];          // wrap-sicher
         if (dCC < 20U * cpuMHz) return;
     }
-    const uint16_t head = airRingHead[idx];
-    airRing[idx][head] = cc;
-    airLastCC[idx]      = cc;
-    airRingHead[idx]    = (uint16_t)((head + 1) % AIR_RING_SIZE);
-    airRingCount[idx]   = airRingCount[idx] + 1;
-
-    // SET PIEZO=0-Fallback: die erste Luft-Flanke nach Ablauf der Sperrzeit
-    // ist der einzige verfuegbare Ausloeser (siehe Rev-4.9-Hinweis oben).
-    if (!cfg.usePiezo && !airTrigPending && nowUs >= lockoutUntil) {
-        airTrigPendingCC = cc;
-        airTrigPendingUs = nowUs;
-        airTrigPending   = true;
-    }
+    airCC[idx][n]   = cc;
+    airLastCC[idx]  = cc;
+    airCount[idx]   = n + 1;
 }
 
-// Piezo (Koerperschall auf der Stahlplatte, siehe PIEZO_PIN) - seit Rev 4.9
-// der alleinige, ereignisgesteuerte Ausloeser der Schusserfassung (siehe
-// Rev-4.9-Hinweis ganz oben): loop() wartet nach piezoPending noch kurz auf
-// nachlaufende Luft-Flanken (SET PIEZOTRAIL/PIEZOMAX) und ruft dann
-// processShot() auf, das den Ringpuffer jedes Mikrofons relativ zu
-// piezoPendingCC durchsucht.
-static volatile bool     piezoPending   = false;
-static volatile uint32_t piezoPendingCC = 0;
-static volatile uint64_t piezoPendingUs = 0;
+// Piezo (Koerperschall auf der Stahlplatte, siehe PIEZO_PIN) - nur EINE
+// Flanke pro Schuss noetig (im Gegensatz zu den Luft-Mics kein Echo-Problem,
+// da direkter Kontaktschall). Bewusst KEINE cfg.airMaxTdoaUs-Pruefung wie
+// bei airISR: das Piezo loest planmaessig deutlich spaeter aus (SET
+// PIEZOMIN..PIEZOMAX, Default 100..1400 us) als das Geometriefenster fuer
+// die Luft-Mics erlaubt.
+static volatile uint32_t piezoCC   = 0;
+static volatile bool     piezoSeen = false;
 
 void IRAM_ATTR piezoISR()
 {
     const uint64_t nowUs = (uint64_t)esp_timer_get_time();
     if (testMode) { testModeHit(NUM_AIR, nowUs); return; }
-    if (!cfg.usePiezo) return;      // SET PIEZO=0: Fallback uebernimmt airISR()
-    if (nowUs < lockoutUntil) return;
-    if (piezoPending) return;        // voriges Ereignis wartet noch auf Auswertung
 
-    piezoPendingCC = esp_cpu_get_cycle_count();
-    piezoPendingUs = nowUs;
-    piezoPending   = true;
+    const uint32_t cc = esp_cpu_get_cycle_count();
+    if (nowUs < lockoutUntil) return;
+    if (!shotInProgress) {
+        shotInProgress = true;
+        firstAirCC     = cc;
+        firstHitTimeUs = nowUs;
+    }
+    if (piezoSeen) return;
+    piezoCC   = cc;
+    piezoSeen = true;
 }
 
-// Setzt nur noch die Trigger-Zustaende zurueck - die Ringpuffer selbst
-// laufen unabhaengig davon kontinuierlich weiter (siehe Rev-4.9-Hinweis oben).
 static void resetShotState()
 {
     noInterrupts();
-    piezoPending   = false;
-    airTrigPending = false;
+    firstAirCC     = 0;
+    firstHitTimeUs = 0;
+    shotInProgress = false;
+    for (int i = 0; i < NUM_AIR; i++) airCount[i] = 0;
+    piezoCC   = 0;
+    piezoSeen = false;
     interrupts();
 }
 
@@ -813,31 +603,26 @@ static void sendStatus()
 
 static void sendShowConfig()
 {
-    char ofsBuf[80], mpxBuf[80], mpyBuf[80], mpzBuf[80];
-    int  on = 0, onx = 0, ony = 0, onz = 0;
+    char ofsBuf[80];
+    int  on = 0;
     for (int i = 0; i < NUM_AIR; i++) {
-        on  += snprintf(ofsBuf + on,  sizeof(ofsBuf) - on,  "%s%ld", i > 0 ? "," : "", (long)cfg.micOffsetNs[i]);
-        onx += snprintf(mpxBuf + onx, sizeof(mpxBuf) - onx, "%s%ld", i > 0 ? "," : "", (long)cfg.micPosOffsetXUm[i]);
-        ony += snprintf(mpyBuf + ony, sizeof(mpyBuf) - ony, "%s%ld", i > 0 ? "," : "", (long)cfg.micPosOffsetYUm[i]);
-        onz += snprintf(mpzBuf + onz, sizeof(mpzBuf) - onz, "%s%ld", i > 0 ? "," : "", (long)cfg.micPosOffsetZUm[i]);
+        on += snprintf(ofsBuf + on, sizeof(ofsBuf) - on, "%s%ld",
+                        i > 0 ? "," : "", (long)cfg.micOffsetNs[i]);
     }
     // Eigener, grosszuegig bemessener Puffer statt emitf() (dessen interner
     // Puffer nur TXBUF_LINE=320 Byte fasst) - die SHOW-Zeile ist mit allen
     // Feldern (SSID/Host/IP/Offsets/Piezo/...) laenger und wuerde sonst
     // stillschweigend abgeschnitten.
-    char line[1100];
+    char line[600];
     int  n = snprintf(line, sizeof(line),
           "{\"type\":\"config\",\"ssid\":\"%s\",\"pass\":\"%s\","
           "\"host\":\"%s\",\"port\":%u,\"lane\":%u,"
           "\"debounce_ms\":%u,\"window_ms\":%u,\"debug\":%d,"
           "\"outlier_um\":%u,\"cluster_radius_um\":%u,\"min_cluster_hits\":%d,"
-          "\"max_precision_um\":%u,\"min_mics\":%d,\"ring_buffer_ms\":%u,"
-          "\"mic_offset_ns\":[%s],"
-          "\"mic_pos_offset_x_um\":[%s],\"mic_pos_offset_y_um\":[%s],"
-          "\"mic_pos_offset_z_um\":[%s],\"cal_shots\":%d,"
-          "\"target\":\"%s\",\"standoff_steel_mm\":%.2f,\"standoff_paper_mm\":%.2f,"
-          "\"use_piezo\":%d,\"piezo_max_us\":%u,"
-          "\"piezo_lead_max_us\":%u,\"piezo_lead_min_us\":%u,\"piezo_trail_max_us\":%u,"
+          "\"max_precision_um\":%u,\"min_mics\":%d,"
+          "\"tdoa_us\":%u,\"mic_offset_ns\":[%s],\"cal_shots\":%d,"
+          "\"target\":\"%s\","
+          "\"use_piezo\":%d,\"piezo_min_us\":%u,\"piezo_max_us\":%u,"
           "\"test_cooldown_ms\":%u,\"offset_x_um\":%ld,\"offset_y_um\":%ld,"
           "\"sound_mps\":%u,"
           "\"static_ip\":%d,\"ip\":\"%s\",\"gateway\":\"%s\","
@@ -847,12 +632,10 @@ static void sendShowConfig()
           cfg.host.c_str(), cfg.port, cfg.lane,
           cfg.debounceMs, cfg.windowMs, cfg.debug,
           cfg.airOutlierUm, cfg.clusterRadiusUm, cfg.minClusterHits,
-          cfg.maxPrecisionUm, cfg.minMics, cfg.ringBufferMs,
-          ofsBuf, mpxBuf, mpyBuf, mpzBuf, cfg.calShotCount,
+          cfg.maxPrecisionUm, cfg.minMics,
+          cfg.airMaxTdoaUs, ofsBuf, cfg.calShotCount,
           cfg.targetMode == TARGET_PAPER ? "paper" : "steel",
-          cfg.standoffSteelMm, cfg.standoffPaperMm,
-          cfg.usePiezo ? 1 : 0, cfg.piezoMaxUs,
-          cfg.piezoLeadMaxUs, cfg.piezoLeadMinUs, cfg.piezoTrailMaxUs,
+          cfg.usePiezo ? 1 : 0, cfg.piezoMinUs, cfg.piezoMaxUs,
           cfg.testCooldownMs, (long)cfg.offsetXUm, (long)cfg.offsetYUm,
           cfg.soundSpeedMps,
           cfg.staticIP ? 1 : 0, cfg.ip.c_str(), cfg.gateway.c_str(),
@@ -875,16 +658,13 @@ static void sendShowConfig()
 // (Stahl/Papier) baugleich, daher ein fester Wert fuer beide Modi.
 #define MIC_HALF_X          115.0f  // mm, horizontaler Abstand Mic-Spalte<->Zentrum
 // Stahlblech (Abprallflaeche, Rev <= 4.x Default): Mics 100mm ueber/unter
-// Mitte, rechtwinklig vor der Platte (Standoff, Default 30mm - je nach
-// Frontplattenstaerke abweichend, seit Rev 4.6 per SET STANDOFFSTEEL
-// konfigurierbar, siehe cfg.standoffSteelMm/applyTargetGeometry()).
+// Mitte, 30mm rechtwinklig vor der Platte.
 #define MIC_HALF_Y_STEEL    100.0f  // mm
-#define MIC_STANDOFF_STEEL   30.0f  // mm, nur Initialwert - siehe oben
+#define MIC_STANDOFF_STEEL   30.0f  // mm
 // Papierscheibe (Durchschlag-Messung, SET TARGET=PAPER): Mics 85mm
-// ueber/unter Mitte, rechtwinklig vor der Scheibe (Standoff, Default 28mm,
-// per SET STANDOFFPAPER konfigurierbar, siehe cfg.standoffPaperMm).
+// ueber/unter Mitte, 28mm rechtwinklig vor der Scheibe.
 #define MIC_HALF_Y_PAPER     85.0f  // mm
-#define MIC_STANDOFF_PAPER   28.0f  // mm, nur Initialwert - siehe oben
+#define MIC_STANDOFF_PAPER   28.0f  // mm
 
 // Schallgeschwindigkeit ist zur Laufzeit konfigurierbar (SET SOUNDSPEED,
 // cfg.soundSpeedMps, Default 355 m/s - empirisch ermittelt, hoeher als die
@@ -909,52 +689,25 @@ static void applySoundSpeed()
 // Schwelle fuer "Mikrofon-Ausreisser" ist zur Laufzeit konfigurierbar:
 // SET OUTLIER=<0.001mm>, siehe cfg.airOutlierUm (Default 5000 = 5.0mm).
 // Zulaessiger Bereich fuer den per Kalibrierung (CAL START) ermittelten
-// bzw. per SET OFS<i> manuell gesetzten Timing-Offset je Mikrofon - bewusst
-// eng an einem physikalisch plausiblen Kabel-/Komparator-Zeitversatz
-// gehalten. War versuchsweise auf 150000 angehoben (Testfrage: findet CAL
-// START bei viel Spielraum einen stabilen Wert?) - Antwort: ja, aber im
-// Bereich von zehntausenden ns, also weit ausserhalb dessen, was ein
-// echter Hardware-Effekt erklaeren koennte (das entspraeche Kabellaengen
-// im Kilometerbereich). Das war Ueberanpassung an die jeweiligen
-// Kalibrier-Schuesse, kein uebertragbarer Kalibrierwert - daher wieder
-// auf den urspruenglichen, plausiblen Bereich zurueckgesetzt.
+// bzw. per SET OFS<i> manuell gesetzten Timing-Offset je Mikrofon.
 #define MIC_OFS_MAX_NS  5000
 
-// Zulaessiger Bereich fuer die per-Mikrofon-Positionsjustage (SET MPOSX/
-// MPOSY/MPOSZ<i>, 0.001mm) - etwas grosszuegiger als der von tools/
-// calibrate_mics.py durchsuchte Bereich (+-3mm, siehe dortiger Kommentar),
-// damit ein manuell nachjustierter Wert nicht knapp an der SET-Grenze haengt.
-#define MIC_POS_OFS_MAX_UM  5000
-
-// Nominal-Positionen (Baugeometrie ohne Justage) - MIC_X_NOM ist fuer beide
-// Zielmodi gleich, MIC_Y_NOM haengt vom Modus ab (siehe applyTargetGeometry()).
-static const float MIC_X_NOM[NUM_AIR] = { -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X };
-
-// MIC_X/MIC_Y/MIC_Z sind die EFFEKTIVEN (laufzeitveraenderlichen) Mic-
-// Positionen = Nominal-Geometrie + Montage-Justage (SET MPOSX/MPOSY/MPOSZ<i>,
-// Default 0 - siehe applyTargetGeometry() unten). MIC_Z ersetzt den bisher
-// EINEN gemeinsamen Standoff-Skalar durch einen Wert je Mikrofon, damit
-// jedes Mikrofon einen eigenen Z-Justagewert bekommen kann.
-static float MIC_X[NUM_AIR] = { -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X };
+// MIC_Y/micStandoffMm sind laufzeitveraenderlich (SET TARGET=STEEL|PAPER,
+// siehe applyTargetGeometry() unten) - MIC_X bleibt fuer beide Modi gleich.
+static const float MIC_X[NUM_AIR] = { -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X };
 static float MIC_Y[NUM_AIR] = { -MIC_HALF_Y_STEEL, -MIC_HALF_Y_STEEL, +MIC_HALF_Y_STEEL, +MIC_HALF_Y_STEEL, 0.0f, 0.0f };
-static float MIC_Z[NUM_AIR] = { MIC_STANDOFF_STEEL, MIC_STANDOFF_STEEL, MIC_STANDOFF_STEEL,
-                                 MIC_STANDOFF_STEEL, MIC_STANDOFF_STEEL, MIC_STANDOFF_STEEL };
+static float micStandoffMm = MIC_STANDOFF_STEEL;
 
-// Setzt MIC_X[]/MIC_Y[]/MIC_Z[] passend zum per SET TARGET gewaehlten
-// Messmodus UND den per-Mikrofon-Justagewerten (SET MPOSX/MPOSY/MPOSZ<i>).
-// Wird beim Booten (nach loadConfig()) und bei jeder Aenderung von SET
-// TARGET/MPOSX/MPOSY/MPOSZ/STANDOFFSTEEL/STANDOFFPAPER aufgerufen - wirkt
-// sofort, kein Reboot noetig.
+// Setzt MIC_Y[]/micStandoffMm passend zum per SET TARGET gewaehlten
+// Messmodus. Wird beim Booten (nach loadConfig()) und bei jeder Aenderung
+// von SET TARGET aufgerufen - wirkt sofort, kein Reboot noetig.
 static void applyTargetGeometry()
 {
-    const float halfY   = (cfg.targetMode == TARGET_PAPER) ? MIC_HALF_Y_PAPER : MIC_HALF_Y_STEEL;
-    const float baseZ   = (cfg.targetMode == TARGET_PAPER) ? cfg.standoffPaperMm : cfg.standoffSteelMm;
-    static const float yNomSign[NUM_AIR] = { -1.0f, -1.0f, +1.0f, +1.0f, 0.0f, 0.0f };
-    for (int i = 0; i < NUM_AIR; i++) {
-        MIC_X[i] = MIC_X_NOM[i]      + (float)cfg.micPosOffsetXUm[i] / 1000.0f;
-        MIC_Y[i] = yNomSign[i]*halfY + (float)cfg.micPosOffsetYUm[i] / 1000.0f;
-        MIC_Z[i] = baseZ             + (float)cfg.micPosOffsetZUm[i] / 1000.0f;
-    }
+    const float halfY = (cfg.targetMode == TARGET_PAPER) ? MIC_HALF_Y_PAPER : MIC_HALF_Y_STEEL;
+    micStandoffMm      = (cfg.targetMode == TARGET_PAPER) ? MIC_STANDOFF_PAPER : MIC_STANDOFF_STEEL;
+    MIC_Y[0] = -halfY; MIC_Y[1] = -halfY;
+    MIC_Y[2] = +halfY; MIC_Y[3] = +halfY;
+    MIC_Y[4] = 0.0f;   MIC_Y[5] = 0.0f;
 }
 
 // Loest (x,y) aus 2 "Loese"-Mics relativ zu einer Referenz (Zeitnullpunkt)
@@ -963,19 +716,19 @@ static void applyTargetGeometry()
 static bool solveAirPair(int ref, int a, int b, const int64_t tNs[NUM_AIR],
                           float *outX, float *outY, float *outD)
 {
-    const float Xr = MIC_X[ref], Yr = MIC_Y[ref], Zr = MIC_Z[ref];
+    const float Xr = MIC_X[ref], Yr = MIC_Y[ref];
     const float ra = (float)(tNs[a] - tNs[ref]) * soundMmPerNs;
     const float rb = (float)(tNs[b] - tNs[ref]) * soundMmPerNs;
 
     // Gleichung je Mic i: 2(Xi-Xr)x + 2(Yi-Yr)y + 2*ri*d = Ki-Kr-ri^2
-    // (Ki = Xi^2+Yi^2+Zi^2 - seit Rev 4.9 per-Mikrofon-Z (MIC_Z[], Montage-
-    // Justage SET MPOSZ<i>), daher Zi^2 explizit statt implizit gekuerzt)
+    // (Ki = Xi^2+Yi^2; der Standoff Zi^2 kuerzt sich weg, da fuer alle
+    // Mics identisch)
     const float A1 = 2.0f * (MIC_X[a] - Xr), B1 = 2.0f * (MIC_Y[a] - Yr), C1 = 2.0f * ra;
-    const float D1 = (MIC_X[a]*MIC_X[a] + MIC_Y[a]*MIC_Y[a] + MIC_Z[a]*MIC_Z[a])
-                    - (Xr*Xr + Yr*Yr + Zr*Zr) - ra*ra;
+    const float D1 = (MIC_X[a]*MIC_X[a] + MIC_Y[a]*MIC_Y[a])
+                    - (Xr*Xr + Yr*Yr) - ra*ra;
     const float A2 = 2.0f * (MIC_X[b] - Xr), B2 = 2.0f * (MIC_Y[b] - Yr), C2 = 2.0f * rb;
-    const float D2 = (MIC_X[b]*MIC_X[b] + MIC_Y[b]*MIC_Y[b] + MIC_Z[b]*MIC_Z[b])
-                    - (Xr*Xr + Yr*Yr + Zr*Zr) - rb*rb;
+    const float D2 = (MIC_X[b]*MIC_X[b] + MIC_Y[b]*MIC_Y[b])
+                    - (Xr*Xr + Yr*Yr) - rb*rb;
 
     // x = x0 + x1*d, y = y0 + y1*d (Cramer'sche Regel)
     const float det = A1*B2 - A2*B1;
@@ -986,11 +739,11 @@ static bool solveAirPair(int ref, int a, int b, const int64_t tNs[NUM_AIR],
     const float y0 = (A1*D2 - A2*D1) / det;
     const float y1 = (A2*C1 - A1*C2) / det;
 
-    // Einsetzen in d^2 = (x-Xr)^2 + (y-Yr)^2 + Zr^2 -> quadratisch in d
+    // Einsetzen in d^2 = (x-Xr)^2 + (y-Yr)^2 + STANDOFF^2 -> quadratisch in d
     const float px = x0 - Xr, py = y0 - Yr;
     const float qa = 1.0f - x1*x1 - y1*y1;
     const float qb = -2.0f * (px*x1 + py*y1);
-    const float qc = -(px*px + py*py + Zr*Zr);
+    const float qc = -(px*px + py*py + micStandoffMm*micStandoffMm);
 
     float d;
     if (fabsf(qa) < 1e-6f) {
@@ -1086,7 +839,7 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
             if (m == ref || m == a || m == b) continue;
             const float dc = sqrtf((x - MIC_X[m])*(x - MIC_X[m])
                                   + (y - MIC_Y[m])*(y - MIC_Y[m])
-                                  + MIC_Z[m]*MIC_Z[m]);
+                                  + micStandoffMm*micStandoffMm);
             const float rc = (float)(tNs[m] - tNs[ref]) * soundMmPerNs;
             residualSum += fabsf(dc - (d + rc));
             nCheck++;
@@ -1151,29 +904,33 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
 // Zeitdifferenz zwischen zwei Mics weg) - Offset[0] wird deshalb fix auf 0
 // gehalten, alle anderen Offsets sind relativ dazu.
 //
-// Optimierung: Pattern-Search / Koordinatenabstieg je Mikrofon (kein
-// Matrix-Solver noetig): Fuer jedes Mic wird abwechselnd ein kleiner
-// Schritt in beide Richtungen probiert und die Aenderung uebernommen, die
-// die Kosten (Summe der solveAirPosition()-Rest-Fehler ueber alle
-// Kalibrier-Schuesse) am staerksten senkt; die Schrittweite wird pro Runde
-// halbiert (grob -> fein).
+// Optimierung: Pattern-Search / Koordinatenabstieg (kein Matrix-Solver
+// noetig), abwechselnd fuer jedes Mic-Offset UND (seit Rev 4.4) fuer die
+// Schallgeschwindigkeit (SET SOUNDSPEED): ein kleiner Schritt in beide
+// Richtungen wird probiert und die Aenderung uebernommen, die die jeweiligen
+// Kosten am staerksten senkt; die Schrittweite wird pro Runde halbiert
+// (grob -> fein).
 //
-// Rev 4.4-4.6 hatten hier zusaetzlich eine automatische Schallgeschwindig-
-// keits-Kalibrierung (SET SOUNDSPEED wurde mitoptimiert, wahlweise per
-// Koordinatenabstieg auf precision_um oder per analytischer Median-
-// Schaetzung). In der Praxis lieferte das aber wiederholt schlechte/
-// unplausible Ergebnisse (vermutlich weil die Kalibrier-Schuesse durch
-// Mehrwege-/Nachhall-Effekte und die AIR4/AIR5-Hardwarethematik oft selbst
-// nicht sauber genug sind, um daraus zuverlaessig auf v zu schliessen) und
-// wurde deshalb wieder entfernt - SET SOUNDSPEED ist wieder ein rein
-// manueller Parameter, den CAL START nicht mehr anfasst.
+// Die Mic-Offsets nutzen als Kosten weiterhin den solveAirPosition()-Rest-
+// Fehler (Konsistenz der Loesung gegen die NICHT an ihr beteiligten Mics).
+// Fuer die Schallgeschwindigkeit funktioniert das empirisch NICHT: der Rest-
+// Fehler steigt mit zunehmender (tatsaechlich korrekterer) Geschwindigkeit
+// tendenziell leicht an, waehrend precision_um (Uebereinstimmung
+// UNTERSCHIEDLICHER Mic-Dreier-Kombinationen untereinander) klar sinkt bzw.
+// cluster_hits steigt - die Geschwindigkeit wird deshalb stattdessen auf
+// precision_um optimiert.
 
-// Kosten der aktuell angenommenen Offsets: Summe des solveAirPosition()-
-// Rest-Fehlers ueber alle gesammelten Kalibrier-Schuesse. Schuesse, die mit
-// den aktuellen Offsets keine Loesung mehr ergeben (geometrisch entartet),
-// werden mit einem Strafwert belegt statt ignoriert zu werden.
-static float calCost(const float offsets[NUM_AIR])
+// Kosten der aktuell angenommenen Offsets/Schallgeschwindigkeit ueber alle
+// gesammelten Kalibrier-Schuesse. usePrecision=false: Summe der Rest-Fehler
+// (fuer die Mic-Offset-Optimierung), usePrecision=true: Summe von
+// precision_um (fuer die Schallgeschwindigkeits-Optimierung). Schuesse, die
+// damit keine Loesung mehr ergeben (geometrisch entartet), werden mit einem
+// Strafwert belegt statt ignoriert zu werden.
+static float calCost(const float offsets[NUM_AIR], float soundSpeedMps, bool usePrecision)
 {
+    const float savedSoundMmPerNs = soundMmPerNs;
+    soundMmPerNs = soundSpeedMps * 1.0e-6f;
+
     float total = 0.0f;
     for (int k = 0; k < calCollected; k++) {
         int64_t corrected[NUM_AIR];
@@ -1186,11 +943,13 @@ static float calCost(const float offsets[NUM_AIR])
         int   hitsN;
         if (solveAirPosition(corrected, calSeenBuf[k], 0.0f, false,
                               &x, &y, &res, &prec, &hitsN)) {
-            total += res;
+            total += usePrecision ? prec : res;
         } else {
-            total += 1000.0f;   // Strafe: Offsets machen Schuss unloesbar
+            total += 1000.0f;   // Strafe: macht Schuss unloesbar
         }
     }
+
+    soundMmPerNs = savedSoundMmPerNs;
     return total;
 }
 
@@ -1198,24 +957,22 @@ static void runCalibration()
 {
     float offsets[NUM_AIR];
     for (int i = 0; i < NUM_AIR; i++) offsets[i] = 0.0f;   // Neukalibrierung
+    float soundSpeed = (float)cfg.soundSpeedMps;   // Start: aktuell konfigurierter Wert
 
     const int   refMic = 0;      // Eichfreiheitsgrad: fix auf Offset 0
-    // Startschrittweite/Rundenzahl bewusst so gewaehlt, dass die Summe aller
-    // Schritte (geometrische Reihe, Faktor 0.5) den vollen erlaubten Bereich
-    // (+-MIC_OFS_MAX_NS=5000, siehe Kommentar dort) tatsaechlich erreichen
-    // kann: 2500*(2-2^-8) ~ 4990ns, letzter Schritt ~9.8ns.
-    float       stepNs = 2500.0f;
-    for (int pass = 0; pass < 9; pass++) {
+    float       stepNs  = 800.0f;
+    float       stepMps = 8.0f;
+    for (int pass = 0; pass < 7; pass++) {
         for (int i = 0; i < NUM_AIR; i++) {
             if (i == refMic) continue;
             const float base     = offsets[i];
-            const float baseCost = calCost(offsets);
+            const float baseCost = calCost(offsets, soundSpeed, false);
 
             offsets[i] = constrain(base + stepNs, (float)-MIC_OFS_MAX_NS, (float)MIC_OFS_MAX_NS);
-            const float costPlus = calCost(offsets);
+            const float costPlus = calCost(offsets, soundSpeed, false);
 
             offsets[i] = constrain(base - stepNs, (float)-MIC_OFS_MAX_NS, (float)MIC_OFS_MAX_NS);
-            const float costMinus = calCost(offsets);
+            const float costMinus = calCost(offsets, soundSpeed, false);
 
             if (baseCost <= costPlus && baseCost <= costMinus) {
                 offsets[i] = base;
@@ -1225,10 +982,38 @@ static void runCalibration()
                 offsets[i] = constrain(base - stepNs, (float)-MIC_OFS_MAX_NS, (float)MIC_OFS_MAX_NS);
             }
         }
-        stepNs *= 0.5f;
+
+        // Schallgeschwindigkeit als zusaetzlicher Freiheitsgrad, gleiches
+        // Koordinatenabstieg-Schema, aber auf precision_um optimiert (siehe
+        // Kommentar oben).
+        {
+            const float base     = soundSpeed;
+            const float baseCost = calCost(offsets, soundSpeed, true);
+
+            soundSpeed = constrain(base + stepMps, (float)SOUND_SPEED_MIN_MPS, (float)SOUND_SPEED_MAX_MPS);
+            const float costPlus = calCost(offsets, soundSpeed, true);
+
+            soundSpeed = constrain(base - stepMps, (float)SOUND_SPEED_MIN_MPS, (float)SOUND_SPEED_MAX_MPS);
+            const float costMinus = calCost(offsets, soundSpeed, true);
+
+            if (baseCost <= costPlus && baseCost <= costMinus) {
+                soundSpeed = base;
+            } else if (costPlus < costMinus) {
+                soundSpeed = constrain(base + stepMps, (float)SOUND_SPEED_MIN_MPS, (float)SOUND_SPEED_MAX_MPS);
+            } else {
+                soundSpeed = constrain(base - stepMps, (float)SOUND_SPEED_MIN_MPS, (float)SOUND_SPEED_MAX_MPS);
+            }
+        }
+
+        stepNs  *= 0.5f;
+        stepMps *= 0.5f;
     }
 
-    char line[220];
+    cfg.soundSpeedMps = (uint16_t)lroundf(soundSpeed);
+    saveVal<uint16_t>("sound_mps", cfg.soundSpeedMps);
+    applySoundSpeed();
+
+    char line[256];
     int  n = snprintf(line, sizeof(line),
                       "{\"type\":\"cal\",\"state\":\"done\",\"offsets_ns\":[");
     for (int i = 0; i < NUM_AIR; i++) {
@@ -1239,166 +1024,76 @@ static void runCalibration()
         n += snprintf(line + n, sizeof(line) - n, "%s%ld",
                       i > 0 ? "," : "", (long)cfg.micOffsetNs[i]);
     }
-    snprintf(line + n, sizeof(line) - n, "],\"shots\":%d}\n", calCollected);
+    n += snprintf(line + n, sizeof(line) - n, "],\"sound_mps\":%u,\"shots\":%d}\n",
+                  cfg.soundSpeedMps, calCollected);
     emitLine(line);
     sendShowConfig();   // komplette Konfiguration direkt im Anschluss zeigen
-    sendCalRawDump();   // Rohdaten aller Kalibrier-Schuesse wiederverwendbar ausgeben
 }
 
-// Gibt die ROHEN (unkorrigierten) Mikrofon-Messwerte aller gerade
-// gesammelten Kalibrier-Schuesse aus (calRawNs/calSeenBuf - dieselben
-// Werte, aus denen runCalibration() oben die Offsets berechnet hat) - eine
-// Zeile je Schuss, im selben air_ns-Format wie ein normales "shot"-
-// Telegramm (siehe processShot()). Zweck: diese Rohdaten liessen sich
-// bisher nur zufaellig ueber SET DEBUG>=1 sichtbare "shot"-Telegramme
-// rekonstruieren (und "sauber" gefilterte Schuesse mit SET DEBUG=0 gar
-// nicht) - mit dieser Ausgabe steht am Ende von CAL START immer eine
-// vollstaendige, direkt wiederverwendbare Kopie bereit (z.B. fuer
-// tools/calibrate_mics.py oder um spaeter mit anderen Parametern
-// offline nachzurechnen, ohne erneut schiessen zu muessen).
-// Da Piezo (bei aktivem SET PIEZO) selbst den Zeit-Nullpunkt bildet (siehe
-// Rev-4.9-Hinweis ganz oben), IST die Piezo-Information bereits vollstaendig
-// in air_ns enthalten (jeder Wert = Abstand dieses Mikrofons zu Piezo) - ein
-// separater "piezo_ns"-Wert waere hier immer 0 und daher nicht informativ.
-static void sendCalRawDump()
+static void processShot()
 {
-    for (int k = 0; k < calCollected; k++) {
-        char cline[300];
-        int  cn = snprintf(cline, sizeof(cline),
-                           "{\"type\":\"calshot\",\"idx\":%d,\"trigger\":\"%s\",\"air_ns\":[",
-                           k, cfg.usePiezo ? "piezo" : "air_fallback");
-        for (int i = 0; i < NUM_AIR; i++) {
-            if (i > 0) cline[cn++] = ',';
-            if (calSeenBuf[k][i]) {
-                cn += snprintf(cline + cn, sizeof(cline) - cn, "%lld", (long long)calRawNs[k][i]);
-            } else {
-                cn += snprintf(cline + cn, sizeof(cline) - cn, "null");
-            }
-        }
-        snprintf(cline + cn, sizeof(cline) - cn, "]}\n");
-        emitLine(cline);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Ringpuffer-Auswertung (Rev 4.9) - siehe Rev-4.9-Hinweis ganz oben
-// ---------------------------------------------------------------------------
-
-// Wrap-sichere SIGNIERTE Zeitdifferenz (a - b) in ns fuer den 32-Bit CPU-
-// Zykluszaehler: die Differenz zweier uint32_t-Werte "wrapt" bei
-// Unterlauf/Ueberlauf automatisch korrekt (Zweierkomplement), die
-// Reinterpretation als int32_t liefert daraus das richtige VORZEICHEN -
-// vorausgesetzt |a-b| liegt klar unter der int32_t-Wrap-Periode (~8,9s bei
-// 240MHz), was fuer alle hier verwendeten ms-Fenster immer gilt.
-static inline int64_t ccDiffNs(uint32_t a, uint32_t b)
-{
-    return (int64_t)((int32_t)(a - b)) * 1000LL / (int64_t)cpuMHz;
-}
-
-// Sucht in Mikrofon i's (lokal gespiegeltem) Ringpuffer die zu refCC am
-// naechsten liegende Flanke innerhalb [loNs,hiNs] (relativ zu refCC),
-// ausserhalb eines optionalen Ausschlussbereichs (exLoNs,exHiNs]
-// (SET PIEZOLEADMIN; exLoNs>=exHiNs deaktiviert den Ausschluss). Der
-// Ringpuffer ist chronologisch geordnet -> die Rueckwaertssuche vom
-// neuesten Eintrag kann abbrechen, sobald ns<loNs unterschritten wird (alle
-// noch aelteren Eintraege liegen dann garantiert ebenfalls ausserhalb).
-static bool ringFindEdge(const uint32_t ring[AIR_RING_SIZE], uint16_t head,
-                          uint32_t count, uint32_t refCC,
-                          int64_t loNs, int64_t hiNs,
-                          int64_t exLoNs, int64_t exHiNs, int64_t *outNs)
-{
-    uint32_t cnt = (count > AIR_RING_SIZE) ? AIR_RING_SIZE : count;
-    bool     found = false;
-    int64_t  bestNs = 0, bestDist = 0;
-    for (uint32_t k = 0; k < cnt; k++) {
-        const uint16_t idx = (uint16_t)((head + AIR_RING_SIZE - 1 - k) % AIR_RING_SIZE);
-        const int64_t  ns  = ccDiffNs(ring[idx], refCC);
-        if (ns < loNs) break;              // alle weiteren (aelteren) Eintraege auch zu alt
-        if (ns > hiNs) continue;           // noch zu neu (Vorwaertsfenster: kommt vor)
-        if (exLoNs < exHiNs && ns > exLoNs && ns <= exHiNs) continue;  // Ausschlussbereich
-        const int64_t dist = (ns >= 0) ? ns : -ns;
-        if (!found || dist < bestDist) { found = true; bestNs = ns; bestDist = dist; }
-    }
-    if (found) *outNs = bestNs;
-    return found;
-}
-
-static void processShot(TriggerSource src, uint32_t refCC, uint64_t refUs)
-{
-    // static statt lokal auf dem Stack: der gespiegelte Ringpuffer allein
-    // waere schon NUM_AIR*AIR_RING_SIZE*4 = 3072 Byte, dazu weiter unten
-    // "line" (bis zu 3800 Byte) - beides zusammen auf dem Stack der Arduino-
-    // Loop-Task (Default 8KB) plus die Aufrufkette (solveAirPosition() etc.)
-    // laesst zu wenig Reserve und kann zu einem stillen Stack-Overflow/
-    // Absturz fuehren (siehe historischer Stack-Overflow-Fund). processShot()
-    // wird ausschliesslich aus loop() heraus aufgerufen (nie parallel/
-    // rekursiv), daher ist "static" hier sicher.
-    static uint32_t localRing[NUM_AIR][AIR_RING_SIZE];
-    uint16_t localRingHead[NUM_AIR];
-    uint32_t localRingCount[NUM_AIR];
+    uint32_t localAirCC[NUM_AIR][AIR_MAX_EDGES];
+    uint8_t  localAirN[NUM_AIR];
+    uint32_t localFirstAirCC;
+    uint64_t localFirstUs;
+    uint32_t localPiezoCC;
+    bool     localPiezoSeen;
 
     noInterrupts();
+    localFirstAirCC = firstAirCC;
     for (int i = 0; i < NUM_AIR; i++) {
-        localRingHead[i]  = airRingHead[i];
-        localRingCount[i] = airRingCount[i];
-        for (int s = 0; s < AIR_RING_SIZE; s++) localRing[i][s] = airRing[i][s];
+        localAirN[i] = airCount[i];
+        for (int e = 0; e < localAirN[i]; e++) localAirCC[i][e] = airCC[i][e];
     }
+    localFirstUs   = firstHitTimeUs;
+    localPiezoCC   = piezoCC;
+    localPiezoSeen = piezoSeen;
     lockoutUntil = (uint64_t)esp_timer_get_time()
                  + (uint64_t)cfg.debounceMs * 1000ULL;
     interrupts();
 
-    // ROHE (unkorrigierte) Auswahl-Flankenzeiten je Mikrofon, in ns relativ
-    // zu refCC (Piezo bzw. im SET PIEZO=0-Fallback die ausloesende Luft-
-    // Flanke selbst) - siehe Rev-4.9-Hinweis ganz oben fuer die Herleitung
-    // der Fenstergrenzen je Modus. Wird unabhaengig vom Reject-Filter
-    // berechnet, da auch fuer die Kalibrierung gebraucht.
+    resetShotState();
+
+    int airHits = 0;
+    for (int i = 0; i < NUM_AIR; i++) if (localAirN[i] > 0) airHits++;
+
+    // ROHE (unkorrigierte) Erst-Flankenzeiten - werden unabhaengig vom
+    // Reject-Filter berechnet, da sie auch fuer die Kalibrierung (unten)
+    // gebraucht werden.
     int64_t airT0NsRaw[NUM_AIR];
     bool    airSeen[NUM_AIR];
-
-    if (src == TRIG_PIEZO) {
-        int64_t loNs, hiNs, exLoNs, exHiNs;
-        if (cfg.targetMode == TARGET_PAPER) {
-            // Rueckwaerts-Suche: [-PIEZOLEAD..-PIEZOLEADMIN] vor Piezo, plus
-            // ein Nachlauf-Fenster [0..+PIEZOTRAIL] danach (das echte
-            // Treffer-Cluster streut leicht UM die Piezo-Zeit). SET
-            // RINGBUFFER deckelt PIEZOLEAD zusaetzlich grob nach oben.
-            const uint32_t ringLeadUs = cfg.ringBufferMs * 1000UL;
-            const uint32_t leadUs = (cfg.piezoLeadMaxUs < ringLeadUs) ? cfg.piezoLeadMaxUs : ringLeadUs;
-            loNs   = -(int64_t)leadUs * 1000LL;
-            hiNs   =  (int64_t)cfg.piezoTrailMaxUs * 1000LL;
-            exLoNs = -(int64_t)cfg.piezoLeadMinUs * 1000LL;
-            exHiNs =  0;
+    for (int i = 0; i < NUM_AIR; i++) {
+        airSeen[i] = localAirN[i] > 0;
+        if (airSeen[i]) {
+            uint32_t dCC = localAirCC[i][0] - localFirstAirCC;   // wrap-sicher
+            airT0NsRaw[i] = (int64_t)((uint64_t)dCC * 1000ULL / (uint64_t)cpuMHz);
         } else {
-            // TARGET_STEEL: Piezo sitzt auf der Trefferflaeche und loest VOR
-            // den Luftmikrofonen aus -> reine Vorwaerts-Suche [0..PIEZOMAX].
-            loNs = 0;
-            hiNs = (int64_t)cfg.piezoMaxUs * 1000LL;
-            exLoNs = exHiNs = 0;   // kein Ausschlussbereich
-        }
-        for (int i = 0; i < NUM_AIR; i++) {
-            int64_t ns;
-            airSeen[i] = ringFindEdge(localRing[i], localRingHead[i], localRingCount[i],
-                                       refCC, loNs, hiNs, exLoNs, exHiNs, &ns);
-            airT0NsRaw[i] = airSeen[i] ? ns : 0;
-        }
-    } else {
-        // TRIG_FALLBACK_AIR (SET PIEZO=0): einfaches Vorwaerts-Fenster ab
-        // der ausloesenden Luft-Flanke, analog zum urspruenglichen "erste
-        // Flanke oeffnet Sammelfenster"-Verhalten - je Mikrofon die
-        // fruehste Flanke im Fenster (entspricht bei einem rein
-        // vorwaertsgerichteten Fenster automatisch der zu refCC
-        // naechstgelegenen, siehe ringFindEdge()).
-        const int64_t hiNs = (int64_t)cfg.windowMs * 1000000LL;
-        for (int i = 0; i < NUM_AIR; i++) {
-            int64_t ns;
-            airSeen[i] = ringFindEdge(localRing[i], localRingHead[i], localRingCount[i],
-                                       refCC, 0, hiNs, 0, 0, &ns);
-            airT0NsRaw[i] = airSeen[i] ? ns : 0;
+            airT0NsRaw[i] = 0;
         }
     }
 
-    int airHits = 0;
-    for (int i = 0; i < NUM_AIR; i++) if (airSeen[i]) airHits++;
+    // Piezo-Verzoegerung relativ zum ersten Luft-Ereignis (siehe Rev-4.3-
+    // Hinweis oben) - unabhaengig von Reject-Filter/Kalibrierung, da rein
+    // diagnostisch bzw. fuer die Sauber-Bewertung (isClean) unten gebraucht.
+    int64_t piezoT0NsRaw = 0;
+    if (localPiezoSeen) {
+        uint32_t dCC = localPiezoCC - localFirstAirCC;   // wrap-sicher
+        piezoT0NsRaw = (int64_t)((uint64_t)dCC * 1000ULL / (uint64_t)cpuMHz);
+    }
+    // PAPER: Geschoss muss die Papier->Stahl-Luecke (8-18cm) erst noch
+    // durchqueren, bevor das Piezo ausloest -> planmaessig SPAETER als der
+    // erste Luftschall-Treffer (SET PIEZOMIN..PIEZOMAX danach), siehe
+    // Rev-4.3-Hinweis oben. STEEL: Die Platte IST die Trefferflaeche - das
+    // Piezo sitzt direkt darauf (quasi latenzfreier Kontaktschall) und ist
+    // damit schneller als die Luftschall-Laufzeit zu JEDEM Mikrofon. Es
+    // loest folglich nahe t=0 aus (haeufig sogar exakt 0, wenn es selbst
+    // firstAirCC gesetzt hat) - eine Mindestverzoegerung (PIEZOMIN) ergibt
+    // hier keinen Sinn und wird deshalb nicht geprueft; PIEZOMAX bleibt als
+    // generelle Ausreisser-Obergrenze fuer beide Modi bestehen.
+    bool piezoOk = localPiezoSeen
+                 && piezoT0NsRaw <= (int64_t)cfg.piezoMaxUs * 1000LL
+                 && (cfg.targetMode == TARGET_STEEL
+                     || piezoT0NsRaw >= (int64_t)cfg.piezoMinUs * 1000LL);
 
     // Kalibrierung (CAL START) laeuft unabhaengig vom normalen Reject-Filter
     // und vom SET DEBUG-Level mit - der Bediener braucht sofort Feedback.
@@ -1428,9 +1123,21 @@ static void processShot(TriggerSource src, uint32_t refCC, uint64_t refUs)
 
     if (airHits < cfg.minMics) {
         if (cfg.debug >= 2) {
-            emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
-                  "\"hits\":%d,\"triggered_by\":\"%s\"}\n",
-                  airHits, airHits, src == TRIG_PIEZO ? "piezo" : "air");
+            // piezo_ns mit ausgeben (auch hier, nicht nur bei "shot"): so
+            // laesst sich der Piezo isoliert testen (z.B. per Klopfen auf
+            // die Stahlplatte), ohne dass genug Luft-Mics fuer einen
+            // vollstaendigen "shot" ausloesen muessen - siehe SET PIEZO.
+            if (cfg.usePiezo && localPiezoSeen) {
+                emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
+                      "\"hits\":%d,\"piezo_ns\":%lld}\n",
+                      airHits, airHits, (long long)piezoT0NsRaw);
+            } else if (cfg.usePiezo) {
+                emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
+                      "\"hits\":%d,\"piezo_ns\":null}\n", airHits, airHits);
+            } else {
+                emitf("{\"type\":\"reject\",\"reason\":\"only %d mic(s)\","
+                      "\"hits\":%d}\n", airHits, airHits);
+            }
         }
         return;
     }
@@ -1465,38 +1172,56 @@ static void processShot(TriggerSource src, uint32_t refCC, uint64_t refUs)
         yUm += cfg.offsetYUm;
     }
 
-    // static statt lokal - unkritisch da processShot() nie parallel/rekursiv
-    // aufgerufen wird (siehe Kommentar bei localRing oben).
-    static char line[600];
+    // 6 Mics x 6 Flanken je bis zu ~8-stellig -> Puffer grosszuegig bemessen
+    char line[900];
     int  n = snprintf(line, sizeof(line),
                       "{\"type\":\"shot\",\"seq\":%u,\"air_ns\":[", sequenceNo);
-    for (int i = 0; i < NUM_AIR; i++) {
+    for (int i = 0; i < NUM_AIR && n < (int)sizeof(line) - 32; i++) {
         if (i > 0) line[n++] = ',';
-        if (airSeen[i]) {
-            n += snprintf(line + n, sizeof(line) - n, "%lld", (long long)airT0NsRaw[i]);
+        line[n++] = '[';
+        for (int e = 0; e < localAirN[i]
+                     && n < (int)sizeof(line) - 24; e++) {
+            if (e > 0) line[n++] = ',';
+            // Luftkanaele referenzieren den ersten erfassten Mikrofon-Hit
+            uint32_t dCC = localAirCC[i][e] - localFirstAirCC;   // wrap-sicher
+            int64_t ns = (int64_t)((uint64_t)dCC * 1000ULL
+                                   / (uint64_t)cpuMHz);
+            n += snprintf(line + n, sizeof(line) - n, "%lld",
+                          (long long)ns);
+        }
+        line[n++] = ']';
+    }
+    n += snprintf(line + n, sizeof(line) - n, "]");
+    n += snprintf(line + n, sizeof(line) - n,
+                  ",\"x_um\":%ld,\"y_um\":%ld,\"pos_res_um\":%ld,"
+                  "\"precision_um\":%ld,\"cluster_hits\":%d,\"pos_valid\":%d",
+                  xUm, yUm, resUm, precUm, clusterN, posOk ? 1 : 0);
+    if (cfg.usePiezo) {
+        if (localPiezoSeen) {
+            n += snprintf(line + n, sizeof(line) - n,
+                          ",\"piezo_ns\":%lld,\"piezo_ok\":%d",
+                          (long long)piezoT0NsRaw, piezoOk ? 1 : 0);
         } else {
-            n += snprintf(line + n, sizeof(line) - n, "null");
+            n += snprintf(line + n, sizeof(line) - n,
+                          ",\"piezo_ns\":null,\"piezo_ok\":0");
         }
     }
-    n += snprintf(line + n, sizeof(line) - n,
-                  "],\"x_um\":%ld,\"y_um\":%ld,\"pos_res_um\":%ld,"
-                  "\"precision_um\":%ld,\"cluster_hits\":%d,\"pos_valid\":%d,"
-                  "\"hits\":%d,\"ts\":%llu}\n",
-                  xUm, yUm, resUm, precUm, clusterN, posOk ? 1 : 0,
-                  airHits, (unsigned long long)(refUs / 1000ULL));
+    snprintf(line + n, sizeof(line) - n, ",\"hits\":%d,\"ts\":%llu}\n",
+             airHits, (unsigned long long)(localFirstUs / 1000ULL));
 
     // DEBUG=0 (Default): nur sauber ermittelte Schuesse (kein Ausreisser,
     // Position bestimmbar, genug uebereinstimmende Mic-Kombinationen,
-    // precision_um innerhalb der Schwelle) werden ausgegeben. DEBUG>=1: auch
-    // Schuesse mit Mikrofon-Ausreisser oder nicht bestimmbarer Position.
-    // Ein durch den Muendungsknall verfrueht ausgeloester Schuss kann seit
-    // Rev 4.9 gar nicht mehr erst hier ankommen (Piezo IST der Ausloeser,
-    // siehe Rev-4.9-Hinweis ganz oben) - die fruehere piezo_ok-Pruefung
-    // entfaellt daher ersatzlos.
+    // precision_um innerhalb der Schwelle, und - falls SET PIEZO=1 - vom
+    // Piezo im erwarteten Zeitfenster bestaetigter Einschlag statt eines
+    // durch den Muendungsknall verfrueht geoeffneten Sammelfensters, siehe
+    // Rev-4.3-Hinweis oben) werden ausgegeben. DEBUG>=1: auch Schuesse mit
+    // Mikrofon-Ausreisser, nicht bestimmbarer Position oder fehlender/
+    // ausserhalb des Fensters liegender Piezo-Bestaetigung.
     bool isClean = posOk
                  && (unsigned long)resUm < cfg.airOutlierUm
                  && clusterN >= (int)cfg.minClusterHits
-                 && (unsigned long)precUm <= cfg.maxPrecisionUm;
+                 && (unsigned long)precUm <= cfg.maxPrecisionUm
+                 && (!cfg.usePiezo || piezoOk);
     if (isClean || cfg.debug >= 1) {
         emitLine(line);
     }
@@ -1519,8 +1244,7 @@ static void sendHelp()
         "#   SET PORT=<1-65535>       TCP-Port des Stand-PC (Reboot noetig)",
         "#   SET LANE=<1-999>         Bahnnummer",
         "#   SET DEBOUNCE=<10-5000>   Sperrzeit nach Schuss in ms",
-        "#   SET WINDOW=<1-50>        Sammelfenster in ms NUR fuer den SET PIEZO=0-",
-        "#                            Fallback (kein Piezo verbaut) relevant",
+        "#   SET WINDOW=<1-50>        Sammelfenster in ms",
         "#   SET DEBUG=<0-3>          Ausgabe-Filter: 0=nur saubere Schuesse,",
         "#                            1=+Mikrofon-Ausreisser, 2=+Reject (wenig Hits),",
         "#                            3=+Kandidaten-Zeilen je Mic-Kombination (type=cand)",
@@ -1530,41 +1254,17 @@ static void sendHelp()
         "#   SET MAXPRECISION=<0-500000>   Max. precision_um fuer sauberen Schuss",
         "#                            in 0.001mm (Default 2000)",
         "#   SET MINMICS=<3-6>        Mindestzahl Mics fuer gueltigen Schuss (Default 5)",
-        "#   SET RINGBUFFER=<1-500>   Wie weit rueckwaerts der kontinuierlich",
-        "#                            laufende Ringpuffer je Mikrofon bei der Piezo-",
-        "#                            Anker-Auswahl hoechstens durchsucht wird, in ms",
-        "#                            (Default 10) - deckelt SET PIEZOLEAD nach oben",
+        "#   SET TDOA=<100-5000>      Geometrie-Plausibilitaetsfenster in us (Default 750)",
         "#   SET TARGET=<STEEL|PAPER> Messmodus/Mic-Geometrie (Default STEEL)",
-        "#   SET STANDOFFSTEEL=<5.0-100.0>  Mic-Standoff (rechtwinklig zur Platte)",
-        "#                            in mm, STEEL-Modus (Default 30.0)",
-        "#   SET STANDOFFPAPER=<5.0-100.0>  Wie STANDOFFSTEEL, PAPER-Modus (Default 28.0)",
-        "#   SET PIEZO=<0|1>          Piezo (Stahlplatte, GPIO34) als alleinigen,",
-        "#                            ereignisgesteuerten Ausloeser der Schuss-",
-        "#                            erfassung nutzen (Default 1/an). 0: Fallback",
-        "#                            auf die erste Luft-Flanke als Ausloeser",
-        "#                            (siehe SET WINDOW)",
-        "#   SET PIEZOMAX=<0-5000>    NUR TARGET=STEEL: wie lange nach dem Piezo-",
-        "#                            Ausloesen gewartet wird, bevor der Ringpuffer",
-        "#                            vorwaerts (0..PIEZOMAX) ausgewertet wird",
-        "#                            (Default 1400us) - dort sitzt das Piezo direkt",
-        "#                            auf der Trefferflaeche und loest VOR den",
-        "#                            Luftmikrofonen aus",
-        "#   SET PIEZOLEAD=<0-20000>  NUR TARGET=PAPER: wie weit VOR der Piezo-",
-        "#                            Ausloesung eine Luft-Flanke je Mikrofon",
-        "#                            hoechstens liegen darf, um fuer die Position",
-        "#                            verwendet zu werden (Default 2000us=2ms,",
-        "#                            zusaetzlich durch SET RINGBUFFER gedeckelt)",
-        "#   SET PIEZOTRAIL=<0-20000> Wie PIEZOLEAD, aber NACH der Piezo-",
-        "#                            Ausloesung (Default 1000us=1ms) - das echte",
-        "#                            Treffer-Cluster streut leicht UM Piezo herum.",
-        "#                            Bestimmt zugleich, wie lange nach dem",
-        "#                            Ausloesen gewartet wird, bevor ausgewertet wird",
-        "#   SET PIEZOLEADMIN=<0-20000>    Untergrenze zu PIEZOLEAD (Default 0=",
-        "#                            aus): Flanken WENIGER als PIEZOLEADMIN vor",
-        "#                            Piezo werden ignoriert - schliesst gezielt",
-        "#                            einen Bereich DIREKT vor Piezo aus (z.B.",
-        "#                            Muendungsknall-Reste), gueltig bleibt nur",
-        "#                            [PIEZOLEAD..PIEZOLEADMIN] vor Piezo",
+        "#   SET PIEZO=<0|1>          Piezo (Stahlplatte, GPIO34) als Trigger-",
+        "#                            Bestaetigung nutzen (Default 1/an)",
+        "#   SET PIEZOMIN=<0-5000>    Min. erwartete Piezo-Verzoegerung in us",
+        "#                            nach erstem Luft-Ereignis (Default 100).",
+        "#                            Gilt NUR im TARGET=PAPER-Modus (im STEEL-",
+        "#                            Modus loest das Piezo quasi latenzfrei bei t=0 aus)",
+        "#   SET PIEZOMAX=<0-5000>    Max. erwartete Piezo-Verzoegerung in us",
+        "#                            nach erstem Luft-Ereignis (Default 1400).",
+        "#                            Ausreisser-Obergrenze fuer STEEL UND PAPER",
         "#   SET TESTMODE=<0|1>       Reiner Sensor-Testmodus (Klartext-Zeile je",
         "#                            Sensor-Ausloesung mit +ms seit dem 1. Sensor",
         "#                            der Serie, 10 '-' nach 5s Stille) - NICHT",
@@ -1581,19 +1281,11 @@ static void sendHelp()
         "#   SET SOUNDSPEED=<300-400> Angenommene Schallgeschwindigkeit in m/s",
         "#                            (Default 355). Radial mit dem Abstand",
         "#                            wachsender Fehler (Rand zu nah am Zentrum)",
-        "#                            -> Wert erhoehen. Rein manueller Wert, wird",
-        "#                            NICHT von CAL START mitkalibriert.",
+        "#                            -> Wert erhoehen. Wird auch von CAL START",
+        "#                            automatisch mitkalibriert.",
         "#   SET CALSHOTS=<3-20>      Anzahl Kalibrier-Schuesse fuer CAL START (Default 5)",
         "#   SET OFS0..OFS5=<-5000..5000>  Timing-Offset je Mikrofon in ns (Default 0,",
         "#                            wird durch CAL START automatisch gesetzt)",
-        "#   SET MPOSX0..MPOSX5=<-5000..5000>  Montage-Justage je Mikrofon in",
-        "#                            X-Richtung, 0.001mm (Default 0)",
-        "#   SET MPOSY0..MPOSY5=<-5000..5000>  Wie MPOSX, Y-Richtung (Default 0)",
-        "#   SET MPOSZ0..MPOSZ5=<-5000..5000>  Wie MPOSX, Z-Richtung (Standoff-",
-        "#                            Achse, rechtwinklig zur Platte/Scheibe,",
-        "#                            Default 0). MPOSX/Y/Z werden NICHT durch",
-        "#                            CAL START gesetzt, sondern offline per",
-        "#                            tools/calibrate_mics.py ermittelt",
         "#   SET STATIC=<0|1>         Statische IP an/aus (Reboot noetig)",
         "#   SET IP=<ip>              Statische IP-Adresse (Reboot noetig)",
         "#   SET GW=<ip>              Gateway, auch: GATEWAY (Reboot noetig)",
@@ -1602,8 +1294,6 @@ static void sendHelp()
         "# Kalibrierung (Timing-Offset je Mikrofon):",
         "#   CAL START                startet Sammlung von SET CALSHOTS Schuessen,",
         "#                            berechnet und speichert die Offsets danach automatisch",
-        "#                            und gibt zusaetzlich je Schuss eine wiederverwend-",
-        "#                            bare 'calshot'-Zeile mit den rohen Mic-Messwerten aus",
         "#   CAL ABORT                bricht laufende Kalibrierung ab (Offsets unveraendert)",
         "#   CAL STATUS               zeigt Kalibrier-Fortschritt",
         "#   CAL RESET                setzt alle Mikrofon-Offsets auf 0 und die",
@@ -1686,12 +1376,12 @@ static bool handleSet(const String &raw)
         cfg.minMics = (uint8_t)v;
         saveVal<uint8_t>("min_mics", cfg.minMics);
         emitf("{\"type\":\"ok\",\"set\":\"minmics\",\"value\":%d}\n", cfg.minMics);
-    } else if (key == "RINGBUFFER") {
+    } else if (key == "TDOA") {
         long v = val.toInt();
-        if (v < 1 || v > 500) { emitLine("{\"type\":\"error\",\"msg\":\"ringbuffer 1-500\"}\n"); return true; }
-        cfg.ringBufferMs = (uint32_t)v;
-        saveVal<uint32_t>("ring_ms", cfg.ringBufferMs);
-        emitf("{\"type\":\"ok\",\"set\":\"ringbuffer\",\"value\":%u}\n", cfg.ringBufferMs);
+        if (v < 100 || v > 5000) { emitLine("{\"type\":\"error\",\"msg\":\"tdoa 100-5000\"}\n"); return true; }
+        cfg.airMaxTdoaUs = (uint32_t)v;
+        saveVal<uint32_t>("tdoa_us", cfg.airMaxTdoaUs);
+        emitf("{\"type\":\"ok\",\"set\":\"tdoa\",\"value\":%u}\n", cfg.airMaxTdoaUs);
     } else if (key == "TARGET") {
         String v = val; v.toUpperCase();
         uint8_t newMode;
@@ -1703,50 +1393,24 @@ static bool handleSet(const String &raw)
         applyTargetGeometry();
         emitf("{\"type\":\"ok\",\"set\":\"target\",\"value\":\"%s\"}\n",
               cfg.targetMode == TARGET_PAPER ? "paper" : "steel");
-    } else if (key == "STANDOFFSTEEL") {
-        float v = val.toFloat();
-        if (v < 5.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"standoffsteel 5.0-100.0\"}\n"); return true; }
-        cfg.standoffSteelMm = v;
-        saveVal<float>("standoff_st", cfg.standoffSteelMm);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"standoffsteel\",\"value\":%.2f}\n", cfg.standoffSteelMm);
-    } else if (key == "STANDOFFPAPER") {
-        float v = val.toFloat();
-        if (v < 5.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"standoffpaper 5.0-100.0\"}\n"); return true; }
-        cfg.standoffPaperMm = v;
-        saveVal<float>("standoff_pa", cfg.standoffPaperMm);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"standoffpaper\",\"value\":%.2f}\n", cfg.standoffPaperMm);
     } else if (key == "PIEZO") {
         long v = val.toInt();
         if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"piezo 0|1\"}\n"); return true; }
         cfg.usePiezo = (v == 1);
         saveVal<bool>("use_piezo", cfg.usePiezo);
         emitf("{\"type\":\"ok\",\"set\":\"piezo\",\"value\":%d}\n", cfg.usePiezo ? 1 : 0);
+    } else if (key == "PIEZOMIN") {
+        long v = val.toInt();
+        if (v < 0 || v > 5000) { emitLine("{\"type\":\"error\",\"msg\":\"piezomin 0-5000\"}\n"); return true; }
+        cfg.piezoMinUs = (uint32_t)v;
+        saveVal<uint32_t>("piezo_min", cfg.piezoMinUs);
+        emitf("{\"type\":\"ok\",\"set\":\"piezomin\",\"value\":%u}\n", cfg.piezoMinUs);
     } else if (key == "PIEZOMAX") {
         long v = val.toInt();
         if (v < 0 || v > 5000) { emitLine("{\"type\":\"error\",\"msg\":\"piezomax 0-5000\"}\n"); return true; }
         cfg.piezoMaxUs = (uint32_t)v;
         saveVal<uint32_t>("piezo_max", cfg.piezoMaxUs);
         emitf("{\"type\":\"ok\",\"set\":\"piezomax\",\"value\":%u}\n", cfg.piezoMaxUs);
-    } else if (key == "PIEZOLEAD") {
-        long v = val.toInt();
-        if (v < 0 || v > 20000) { emitLine("{\"type\":\"error\",\"msg\":\"piezolead 0-20000\"}\n"); return true; }
-        cfg.piezoLeadMaxUs = (uint32_t)v;
-        saveVal<uint32_t>("piezo_lead", cfg.piezoLeadMaxUs);
-        emitf("{\"type\":\"ok\",\"set\":\"piezolead\",\"value\":%u}\n", cfg.piezoLeadMaxUs);
-    } else if (key == "PIEZOTRAIL") {
-        long v = val.toInt();
-        if (v < 0 || v > 20000) { emitLine("{\"type\":\"error\",\"msg\":\"piezotrail 0-20000\"}\n"); return true; }
-        cfg.piezoTrailMaxUs = (uint32_t)v;
-        saveVal<uint32_t>("piezo_trail", cfg.piezoTrailMaxUs);
-        emitf("{\"type\":\"ok\",\"set\":\"piezotrail\",\"value\":%u}\n", cfg.piezoTrailMaxUs);
-    } else if (key == "PIEZOLEADMIN") {
-        long v = val.toInt();
-        if (v < 0 || v > 20000) { emitLine("{\"type\":\"error\",\"msg\":\"piezoleadmin 0-20000\"}\n"); return true; }
-        cfg.piezoLeadMinUs = (uint32_t)v;
-        saveVal<uint32_t>("piezo_leadmin", cfg.piezoLeadMinUs);
-        emitf("{\"type\":\"ok\",\"set\":\"piezoleadmin\",\"value\":%u}\n", cfg.piezoLeadMinUs);
     } else if (key == "TESTMODE") {
         long v = val.toInt();
         if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"testmode 0|1\"}\n"); return true; }
@@ -1809,48 +1473,6 @@ static bool handleSet(const String &raw)
         snprintf(key2, sizeof(key2), "ofs%d", idx);
         saveVal<int32_t>(key2, cfg.micOffsetNs[idx]);
         emitf("{\"type\":\"ok\",\"set\":\"ofs%d\",\"value\":%ld}\n", idx, (long)cfg.micOffsetNs[idx]);
-    } else if (key.startsWith("MPOSX") && key.length() == 6 && isDigit(key[5])) {
-        int idx = key[5] - '0';
-        if (idx >= NUM_AIR) { emitLine("{\"type\":\"error\",\"msg\":\"unknown key\"}\n"); return true; }
-        long v = val.toInt();
-        if (v < -MIC_POS_OFS_MAX_UM || v > MIC_POS_OFS_MAX_UM) {
-            emitf("{\"type\":\"error\",\"msg\":\"mposx%d %d..%d\"}\n", idx, -MIC_POS_OFS_MAX_UM, MIC_POS_OFS_MAX_UM);
-            return true;
-        }
-        cfg.micPosOffsetXUm[idx] = (int32_t)v;
-        char key2[8];
-        snprintf(key2, sizeof(key2), "mpx%d", idx);
-        saveVal<int32_t>(key2, cfg.micPosOffsetXUm[idx]);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"mposx%d\",\"value\":%ld}\n", idx, (long)cfg.micPosOffsetXUm[idx]);
-    } else if (key.startsWith("MPOSY") && key.length() == 6 && isDigit(key[5])) {
-        int idx = key[5] - '0';
-        if (idx >= NUM_AIR) { emitLine("{\"type\":\"error\",\"msg\":\"unknown key\"}\n"); return true; }
-        long v = val.toInt();
-        if (v < -MIC_POS_OFS_MAX_UM || v > MIC_POS_OFS_MAX_UM) {
-            emitf("{\"type\":\"error\",\"msg\":\"mposy%d %d..%d\"}\n", idx, -MIC_POS_OFS_MAX_UM, MIC_POS_OFS_MAX_UM);
-            return true;
-        }
-        cfg.micPosOffsetYUm[idx] = (int32_t)v;
-        char key2[8];
-        snprintf(key2, sizeof(key2), "mpy%d", idx);
-        saveVal<int32_t>(key2, cfg.micPosOffsetYUm[idx]);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"mposy%d\",\"value\":%ld}\n", idx, (long)cfg.micPosOffsetYUm[idx]);
-    } else if (key.startsWith("MPOSZ") && key.length() == 6 && isDigit(key[5])) {
-        int idx = key[5] - '0';
-        if (idx >= NUM_AIR) { emitLine("{\"type\":\"error\",\"msg\":\"unknown key\"}\n"); return true; }
-        long v = val.toInt();
-        if (v < -MIC_POS_OFS_MAX_UM || v > MIC_POS_OFS_MAX_UM) {
-            emitf("{\"type\":\"error\",\"msg\":\"mposz%d %d..%d\"}\n", idx, -MIC_POS_OFS_MAX_UM, MIC_POS_OFS_MAX_UM);
-            return true;
-        }
-        cfg.micPosOffsetZUm[idx] = (int32_t)v;
-        char key2[8];
-        snprintf(key2, sizeof(key2), "mpz%d", idx);
-        saveVal<int32_t>(key2, cfg.micPosOffsetZUm[idx]);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"mposz%d\",\"value\":%ld}\n", idx, (long)cfg.micPosOffsetZUm[idx]);
     } else if (key == "WINDOW") {
         long v = val.toInt();
         if (v < 1 || v > 50) { emitLine("{\"type\":\"error\",\"msg\":\"window 1-50\"}\n"); return true; }
@@ -2085,9 +1707,8 @@ void setup()
 void loop()
 {
     // Reiner Sensor-Testmodus (SET TESTMODE=1): laeuft komplett unabhaengig
-    // von der Schusserfassung (die ISRs schreiben in diesem Modus weder in
-    // den Ringpuffer noch setzen sie piezoPending/airTrigPending, siehe
-    // airISR()/piezoISR() oben).
+    // von der Schuss-/TDOA-Logik (die ISRs setzen in diesem Modus weder
+    // shotInProgress noch airCC/piezoCC, siehe airISR()/piezoISR() oben).
     if (testMode) {
         // Erst ALLE seit dem letzten loop()-Durchlauf ausgeloesten Sensoren
         // einsammeln (mit ISR-Zeitstempel, nicht Poll-Zeit) und das fruehste
@@ -2119,7 +1740,7 @@ void loop()
             // Der erste Sensor nach einer Trennlinie startet die Serie bei
             // 0ms, alle weiteren zeigen die Verzoegerung dazu - damit laesst
             // sich bei einem echten Schuss direkt ablesen, welches
-            // Zeitfenster (z.B. SET PIEZOLEAD/PIEZOMAX) zuschlagen koennte.
+            // Zeitfenster (z.B. SET TDOA/PIEZOMAX) zuschlagen koennte.
             if (!testSeriesActive) {
                 testSeriesStartUs = batchMinUs;
                 testSeriesActive  = true;
@@ -2145,37 +1766,20 @@ void loop()
         }
     }
 
-    // Rev 4.9: Piezo ist der alleinige, ereignisgesteuerte Ausloeser (siehe
-    // Rev-4.9-Hinweis ganz oben) - kein Polling/Timeout mehr auf eine
-    // Piezo-"Bestaetigung". Nach dem Ausloesen wird noch kurz gewartet, bis
-    // nachlaufende Luft-Flanken im Ringpuffer angekommen sind (TARGET=PAPER:
-    // SET PIEZOTRAIL, das echte Treffer-Cluster streut leicht NACH Piezo;
-    // TARGET=STEEL: SET PIEZOMAX, dort kommen die Luft-Flanken NACH dem
-    // quasi latenzfreien Piezo-Kontaktschall an), dann wird ausgewertet.
-    if (piezoPending) {
+    if (shotInProgress) {
         const uint64_t now = (uint64_t)esp_timer_get_time();
-        const uint64_t waitUs = (cfg.targetMode == TARGET_STEEL)
-                               ? (uint64_t)cfg.piezoMaxUs
-                               : (uint64_t)cfg.piezoTrailMaxUs;
-        if (now - piezoPendingUs >= waitUs) {
-            noInterrupts();
-            const uint32_t refCC = piezoPendingCC;
-            const uint64_t refUs = piezoPendingUs;
-            piezoPending = false;
-            interrupts();
-            processShot(TRIG_PIEZO, refCC, refUs);
+        // Bei aktivem Piezo (SET PIEZO=1, Default) muss das Sammelfenster
+        // mindestens bis SET PIEZOMAX + Sicherheitsmarge offen bleiben,
+        // sonst wuerde das planmaessig erst 0,1-1,4ms nach dem ersten
+        // Luft-Ereignis eintreffende Piezo-Signal verpasst (siehe
+        // Rev-4.3-Hinweis oben). SET WINDOW bleibt die untere Grenze.
+        uint64_t effWindowUs = (uint64_t)cfg.windowMs * 1000ULL;
+        if (cfg.usePiezo) {
+            const uint64_t piezoWaitUs = (uint64_t)cfg.piezoMaxUs + 200ULL;
+            if (piezoWaitUs > effWindowUs) effWindowUs = piezoWaitUs;
         }
-    } else if (airTrigPending) {
-        // SET PIEZO=0-Fallback: SET WINDOW lang ab der ausloesenden
-        // Luft-Flanke vorwaerts sammeln, dann auswerten.
-        const uint64_t now = (uint64_t)esp_timer_get_time();
-        if (now - airTrigPendingUs >= (uint64_t)cfg.windowMs * 1000ULL) {
-            noInterrupts();
-            const uint32_t refCC = airTrigPendingCC;
-            const uint64_t refUs = airTrigPendingUs;
-            airTrigPending = false;
-            interrupts();
-            processShot(TRIG_FALLBACK_AIR, refCC, refUs);
+        if (now - firstHitTimeUs >= effWindowUs) {
+            processShot();
         }
     }
 

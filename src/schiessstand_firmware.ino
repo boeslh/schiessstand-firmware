@@ -1,6 +1,284 @@
 /*
  * ============================================================================
  *  Elektronischer Schießstand – ESP32 Firmware
+ *  Rev 4.10.1 – Zwei Korrekturen an der in 4.10.0 eingefuehrten TCP-
+ *              Authentifizierung (bei der Einbindung von 4.10.0 wurde
+ *              versehentlich von einer aelteren Basis ausgegangen, siehe
+ *              Rev-4.9.1-Hinweis unten):
+ *              (1) TESTSHOOT [<z_mm>] (Rev 4.9.1) war dabei komplett
+ *              verlorengegangen (Befehl, handleTestShoot(), synthetic-
+ *              ShotPending, das "synthetic"-Feld in shot/reject, HELP-Text)
+ *              - wiederhergestellt, unveraendert zu Rev 4.9.1.
+ *              (2) emitLine() signierte TCP-Zeilen bisher ueber einen auf
+ *              TXBUF_LINE (340 Byte) begrenzten Zwischenpuffer - dadurch
+ *              blieben laengere Telegramme (v.a. "config", eigener 900-Byte-
+ *              Puffer, typischer Inhalt bereits >500 Byte) bei konfiguriertem
+ *              SET PSK FAST IMMER unsigniert, obwohl der Datei-Kopf "jede
+ *              Zeile" verspricht. Fix: Tag und Nutzlast werden bei
+ *              bestehender TCP-Verbindung jetzt als zwei getrennte
+ *              tcp.write()-Aufrufe gesendet (siehe emitLine()) - dadurch
+ *              entfaellt die Laengenbegrenzung fuers Signieren komplett,
+ *              unabhaengig von TXBUF_LINE. TXBUF_LINE selbst (jetzt 360)
+ *              bleibt nur noch als Kapazitaet des Offline-Ringpuffers
+ *              (txBufPush(), ausschliesslich fuer shot/reject bei fehlender
+ *              TCP-Verbindung) und des emitf()-Formatpuffers relevant.
+ * ============================================================================
+ *
+ *  Rev 4.10.0 – TCP-Authentifizierung: die bisher voellig ungeschuetzte
+ *              TCP-Verbindung zum Stand-PC (jedes Geraet im selben Netz
+ *              konnte Befehle wie SET/REBOOT/FACTORY senden oder gefaelschte
+ *              shot-Telegramme einspeisen) traegt jetzt optional ein
+ *              HMAC-SHA256-Tag (mbedtls_md_hmac, Hardware-beschleunigt -
+ *              vernachlaessigbare Rechenlast, KEIN TLS-Handshake) je Zeile:
+ *              "<16-Hex-Zeichen-Tag> <Zeile>\n", Tag = erste 8 Byte von
+ *              HMAC-SHA256(psk, Zeile). Schluessel ist ein einziger,
+ *              ANLAGENWEITER Pre-Shared Key (AUTH_PSK_DEFAULT_HEX, siehe
+ *              oben nahe NVS_NS - einmal pro Anlage erzeugen und in ALLE
+ *              geflashten Geraete kompilieren, damit ein Ersatzgeraet ohne
+ *              Pairing sofort einsatzbereit ist), ueber SET PSK=<64
+ *              Hex-Zeichen> auch nachtraeglich setz-/rotierbar (siehe
+ *              handleSet(), applyPskHex()). Leerer Schluessel = Feature
+ *              komplett aus (Rueckwaertskompatibel fuer einen risikofreien
+ *              Rollout). Verifikation beim Empfang in verifyIncomingIfTcp()
+ *              (aufgerufen aus handleCommand(), noch vor dem Korrelations-
+ *              ID-Parsing), Signieren beim Versand im tcp.write()-Zweig von
+ *              emitLine(). BEWUSST NUR der TCP-Kanal - Serial bleibt
+ *              vollstaendig unveraendert/unsigniert, da physischer
+ *              Kabelzugriff dort schon die Absicherung ist und der
+ *              dokumentierte manuelle Diagnose-Workflow (HELP/PIN/Terminal)
+ *              sonst kaputt ginge (siehe pollCommands()/handleCommand()
+ *              Parameter viaTcp). Keine Verschluesselung (Confidentiality)
+ *              - nur Authentizitaet/Integritaet, bewusster Kompromiss fuer
+ *              minimale Rechenlast; Mitlesen auf dem lokalen Netz (z.B. des
+ *              per SET PASS=... uebertragenen WLAN-Passworts) bleibt
+ *              moeglich. Nebenbei behoben: der Kommandopuffer (AUTH_CMD_BUF_LEN,
+ *              vorher fest 96 Zeichen) war schon fuer die laengste
+ *              dokumentierte Zeile (CAL IMPORT OFS0=...,...,SOUNDSPEED=...)
+ *              knapp/zu klein und reicht jetzt mit Signatur-Praefix erst
+ *              recht nicht mehr - auf 220 Zeichen erhoeht (TXBUF_LINE
+ *              analog von 320 auf 340).
+ * ============================================================================
+ *
+ *  Rev 4.9.0 – Erste Stufe der erweiterten Stand-PC-Interaktion (siehe
+ *              docs/remote-interaktion-konzept.md): (1) Jedes status/config/
+ *              confignet/cal-Telegramm traegt jetzt ein "mac"-Feld (Basis-
+ *              MAC per esp_read_mac(), unabhaengig vom WLAN-Status) als
+ *              stabile Geraete-ID fuer die Stand-PC-Datenhaltung. (2) Jeder
+ *              Befehl kann mit einem Suffix " #<id>" versehen werden, dessen
+ *              Wert die Antwort als zusaetzliches "corr"-Feld zuordenbar
+ *              macht (siehe pendingCorrId/emitLine()). (3) Neuer ACTION-
+ *              Namensraum: ACTION LIGHT=ON|OFF|AUTO uebersteuert die bisher
+ *              rein automatische Standbeleuchtung (serviceLight()), ACTION
+ *              TARGETCHANGE loest - wie TESTSHOOTPAPER - einen Papiervorschub
+ *              aus, aber unter einem fuer den produktiven Bedienfall
+ *              sprechenden Namen (identischer Codepfad). (4) CAL IMPORT
+ *              schreibt Mikrofon-Offsets/Schallgeschwindigkeit atomar aus
+ *              einer vom Stand-PC gespeicherten Kalibrierung zurueck (erst
+ *              alle Werte validieren, dann erst schreiben - kein
+ *              Teilzustand bei Uebertragungsabbruch). (5) Sicherheitsnetz
+ *              fuer Netzwerk-Fernkonfiguration: die erste SET SSID/PASS/
+ *              HOST/PORT/STATIC/IP/GW/SUBNET/DNS-Aenderung je Bootzyklus
+ *              sichert die bis dahin gueltigen Werte als Ruecksprungpunkt
+ *              (NVS "*_prv"-Keys + "net_pnd"-Flag), siehe
+ *              armNetWatchdogIfNeeded(). Bestaetigt niemand die neue
+ *              Konfiguration per NET CONFIRM innerhalb von 3 Minuten nach
+ *              dem naechsten Boot (serviceNetWatchdog()), schreibt der ESP32
+ *              die gesicherten Werte automatisch zurueck und rebootet erneut
+ *              - verhindert, dass eine fehlerhafte Fernkonfiguration das
+ *              Geraet dauerhaft unerreichbar macht. NET STATUS zeigt den
+ *              Zustand, confignet zusaetzlich per net_pending/
+ *              net_confirm_deadline_s.
+ * ============================================================================
+ *
+ *  Rev 4.8.10 – Neu: Kommando TESTSHOOTPAPER - loest servicePaperStepper()/
+ *              startPaperFeed() aus, so als waere gerade ein Schuss
+ *              registriert worden, zum Testen von Mechanik/Treiber ohne
+ *              echten Schuss auf die Scheibe. Bewusst unabhaengig von
+ *              PAPERAUTO/PAPERTRIGGER (die filtern nur ECHTE Schuesse) und
+ *              OHNE shotCounter/sequenceNo zu erhoehen oder ein "shot"-
+ *              Telegramm zu senden, damit der Stand-PC keinen Phantom-
+ *              Treffer sieht. Ignoriert (Fehlermeldung), wenn gerade schon
+ *              ein Vorschub/Einfaedeln laeuft.
+ * ============================================================================
+ *
+ *  Rev 4.8.9 – Default fuer SET PAPERDIR (cfg.paperDirInvert) von 0 auf 1
+ *              gedreht: mit der unveraenderten DIR-Polaritaet lief der
+ *              Papiervorschub am TMC2209 rueckwaerts statt vorwaerts (per
+ *              TESTMODE=1 anhand von "PAPER DIR(GPIO18) = LOW (rueckwaerts)"
+ *              festgestellt). SET PAPERDIR=0|1 bleibt weiterhin zur Laufzeit
+ *              umschaltbar, invertiert jetzt aber ab Werk.
+ * ============================================================================
+ *
+ *  Rev 4.8.8 – Treiber ist tatsaechlich ein TMC2209 (nicht DRV8825/A4988) und
+ *              laeuft mit MS1/MS2 im Werkszustand (unbeschaltet/UART-Pins
+ *              offen) auf 1/8-Microstepping, also 8 * 200 = 1600 Schritte/
+ *              Umdrehung statt der bisher angenommenen 200 Vollschritte.
+ *              PAPER_STEPS_PER_REV entsprechend angepasst - ohne das war der
+ *              tatsaechliche Vorschub nur 1/8 der per SET PAPERFEED/PAPERSPEED
+ *              eingestellten mm. STEP/DIR/EN-Ansteuerung selbst unveraendert,
+ *              TMC2209 verhaelt sich dabei wie DRV8825/A4988 (STEP-Flanke,
+ *              DIR-Pegel, EN aktiv-LOW).
+ * ============================================================================
+ *
+ *  Rev 4.8.7 – STEP-Signal (Papiervorschub) von GPIO5 auf GPIO21 verlegt -
+ *              GPIO5 ist ein Strapping-Pin (Boot-Modus) und dafuer offenbar
+ *              nicht zuverlaessig genug. DIR (GPIO18) und EN (GPIO19)
+ *              unveraendert, GPIO21 liegt auf dem Devkit weiterhin in
+ *              unmittelbarer Naehe der beiden.
+ * ============================================================================
+ *
+ *  Rev 4.8.6 – STEP-Impuls (GPIO5) hatte eine feste, fuer den Treiber locker
+ *              ausreichende Mindest-High-Zeit von 4us (PAPER_STEP_PULSE_US,
+ *              per delayMicroseconds() blockierend erzeugt) - an einer zur
+ *              Fehlersuche angeklemmten LED war davon nichts zu sehen. Die
+ *              High-Zeit ist jetzt dynamisch die HALBE aktuelle Schritt-
+ *              periode (50% Tastgrad, PAPER_STEP_PULSE_MIN_US nur noch
+ *              Untergrenze) - bei SET PAPERJOGSPEED/PAPERSPEED im niedrigen
+ *              Bereich damit als LED-Blinken sichtbar. Dafuer komplett auf
+ *              nicht-blockierend umgestellt: paperStepRise() zieht STEP nur
+ *              noch HIGH und merkt sich in paperStepFallUs, wann die
+ *              Ruecklanke faellig ist - erledigt wird die dann am Anfang von
+ *              servicePaperStepper() bei jedem loop()-Durchlauf (ein
+ *              delayMicroseconds() ueber ggf. zig/hundert Millisekunden
+ *              haette sonst Schusserfassung/Netzwerk/Kommandos blockiert).
+ * ============================================================================
+ *
+ *  Rev 4.8.5 – Neu: PIN-Diagnose (Verdacht auf einen defekten GPIO) - PIN <n>
+ *              IN|PULLUP|PULLDOWN setzt einen GPIO aus einer Positivliste
+ *              (aktuell 0,2,4,5,15,16,17,18,19) als Eingang und liest ihn
+ *              sofort, PIN <n> OUT=<0|1> setzt ihn als Ausgang auf LOW/HIGH,
+ *              PIN <n> READ liest den zuletzt gesetzten Modus erneut, PIN
+ *              LIST zeigt Modus+Pegel aller erlaubten Pins. NICHT NVS-
+ *              persistent (wie SET TESTMODE) - nach Reboot wieder im
+ *              normalen Betriebszustand. Ueberschreibt bei den Pins, die
+ *              gleichzeitig vom Papiervorschub genutzt werden (5/16-19),
+ *              dessen Modus/Pegel bis zum naechsten Schritt-Impuls bzw. zur
+ *              naechsten Schalter-Abfrage - fuer gezielte Pin-Fehlersuche
+ *              gewollt. Siehe handlePinCommand()/PIN_DIAG_ALLOWED[].
+ * ============================================================================
+ *
+ *  Rev 4.8.4 – Geschwindigkeit des manuellen Dauerbetriebs (Einfaedeln ueber
+ *              die Kippschalter-Positionen) war fest auf 15.0 mm/s einkompi-
+ *              liert und damit fuers Einfaedeln zu langsam - jetzt per SET
+ *              PAPERJOGSPEED=<1.0-100.0> (mm/s) laufzeitkonfigurierbar,
+ *              Default 75.0 (= 5x der bisherigen festen Geschwindigkeit).
+ *              cfg.paperJogSpeedMmS ersetzt das bisherige PAPER_JOG_SPEED_
+ *              MMPS-Define, in SHOW als paper_jog_speed_mmps enthalten.
+ * ============================================================================
+ *
+ *  Rev 4.8.3 – SET TESTMODE=1 gibt jetzt auch fuer den Papiervorschub Klartext-
+ *              Zeilen aus (Fehlersuche an den Einfaedel-Schaltern): bei jeder
+ *              Pegelaenderung an GPIO16/17 ("erkannt"/"losgelassen"), bei
+ *              jeder Aenderung von DIR/EN (siehe paperSetDir()/paperEnable())
+ *              sowie alle 100 STEP-Impulse eine Zaehler-Zeile (jeden
+ *              einzelnen Impuls zu loggen wuerde die Ausgabe fluten). Siehe
+ *              paperTestLog()/servicePaperStepper().
+ * ============================================================================
+ *
+ *  Rev 4.8.2 – Pinbelegung Papiervorschub getauscht: STEP/DIR/EN liegen jetzt
+ *              auf GPIO5/18/19 (auf dem Devkit nebeneinander, samt GND-Pin
+ *              in der Naehe - praktisch fuer einen gemeinsamen Treiber-
+ *              Stecker), die beiden Einfaedel-Schalter auf GPIO16/17 (vorher
+ *              STEP/DIR/EN=5/16/17, Schalter=18/19). Reine Pin-Umbelegung,
+ *              Verhalten/Logik unveraendert.
+ * ============================================================================
+ *
+ *  Rev 4.8.1 – Diagnose-Test 3 (GPIO32->GPIO35, siehe Rev-4.4.8-Hinweis
+ *              weiter unten) physisch zurueckgebaut - AIR_PINS[4] wieder auf
+ *              GPIO32, TEST_SENSOR_NAMES[4] wieder ohne "(GPIO35!)"-Zusatz.
+ *              Damit sind jetzt alle 3 Hardware-Diagnosetests an Kanal 4
+ *              ("links mitte") zurueckgebaut, die Ursache blieb das LM339
+ *              dieses Kanals selbst (siehe Testverlauf weiter unten).
+ * ============================================================================
+ *
+ *  Rev 4.8.0 – Neu: Papiervorschub. Ein NEMA17-Schrittmotor (1,8 Grad/Schritt,
+ *              50,2mm Vorschub/Umdrehung) ueber ein DRV8825/A4988-Treiber-
+ *              board zieht die Papierrolle hinter dem Scheibenzentrum nach
+ *              jedem Schuss ein Stueck weiter (STEP=GPIO5, DIR=GPIO18,
+ *              EN=GPIO19, aktiv-LOW). SET PAPERFEED=<10.0-100.0> (mm,
+ *              Default 50.0) und SET PAPERSPEED=<0.5-30.0> (mm/s, Default
+ *              5.0) sind zur Laufzeit konfigurierbar; die zweite Haelfte der
+ *              Strecke bremst linear auf ca. 30% der eingestellten
+ *              Geschwindigkeit ab (PAPER_DECEL_END_FRACTION), damit die Rolle
+ *              durch ihre Massentraegheit am Ende nicht nachlaeuft. SET
+ *              PAPERTRIGGER=ANY|PIEZO|CLEAN legt fest, bei welcher Art
+ *              Ausloesung vorgeschoben wird (Default PIEZO: nur wenn das
+ *              Piezo den Einschlag bestaetigt hat, unabhaengig vom Luft-Mic-
+ *              Ergebnis), SET PAPERAUTO=0|1 schaltet den automatischen
+ *              Vorschub komplett ab (z.B. fuer Testschuesse/Kalibrierung
+ *              ohne Papierverbrauch, Default 1/an). SET PAPERDIR=0|1
+ *              invertiert die Drehrichtung softwareseitig (vertauschte
+ *              Motoranschluesse). Zusaetzlich 2 Positionen eines Kipp-
+ *              schalters (GPIO16/17, kein Mittel-Aus) fuer manuellen
+ *              Dauerbetrieb beim Einfaedeln der Rolle - haben Vorrang vor
+ *              einem laufenden automatischen Vorschub; liegt an keinem oder
+ *              (Fehlerfall) an beiden Pins ein Signal an, wird gestoppt.
+ *              Komplett nicht-blockierend ueber servicePaperStepper() in
+ *              loop() umgesetzt (kein delay() waehrend des Vorschubs), damit
+ *              Schusserfassung/Netzwerk/Kommandos nicht stillstehen.
+ * ============================================================================
+ *
+ *  Rev 4.7.4 – SHOW ("type":"config") wurde trotz Auslagerung der Netzwerk-
+ *              Felder (Rev 4.7.1) mit den seither dazugekommenen Feldern
+ *              (mic_half_x_mm, bullet_shift_pct/cap_mm) wieder zu lang fuer
+ *              den 500-Byte-Puffer und schnitt am Ende ab (offset_x_um/
+ *              offset_y_um/sound_mps fehlten) - Puffer auf 700 Byte erhoeht
+ *              (deckt den rechnerischen Worst-Fall aller Felder bei
+ *              Maximalwerten, ~592 Byte, mit Marge ab). Ausserdem: wifi/tcp
+ *              (Live-Verbindungsstatus) aus STATUS nach SHOWNET verschoben
+ *              (dort als wifi_ip/tcp_connected) - gehoeren inhaltlich zur
+ *              Netzwerkseite, nicht zum Auswertungs-/Betriebsstatus.
+ * ============================================================================
+ *
+ *  Rev 4.7.3 – Horizontaler Mic-Abstand zur Mittellinie (bisher fest
+ *              einkompiliertes MIC_HALF_X=115.0mm) ist jetzt zur Laufzeit
+ *              konfigurierbar: SET MICHALFX (5.0-300.0mm, Default 115.0,
+ *              cfg.micHalfXMm) - deckt z.B. ab, dass die Mikrofon-Membran
+ *              1-2mm hinter der bisher vermessenen aeusseren Huelle liegt.
+ *              Neue Funktion applyMicHalfX() setzt MIC_X[] (jetzt nicht mehr
+ *              const), analog zu applyTargetGeometry() fuer MIC_Y/Standoff -
+ *              aber bewusst getrennt, da MIC_X nicht vom Zielmodus abhaengt.
+ *              Wirkt sofort, kein Reboot noetig, in SHOW mit ausgegeben.
+ * ============================================================================
+ *
+ *  Rev 4.7.2 – runCalibration(): 2 zusaetzliche, noch feinere Runden (jetzt
+ *              11 statt 9) im Koordinatenabstieg. Beobachtung (Nachbau der
+ *              echten Kalibrier-Schuesse in Python): bei nur 5 Kalibrier-
+ *              Schuessen kann ein Mic-Offset ueber mehrere Runden hinweg
+ *              exakt auf einem groben Zwischenschritt "einfrieren" (Kosten-
+ *              funktion dort zu flach fuer die jeweilige Schrittweite), statt
+ *              weiter zu konvergieren - erreichbarer Bereich bleibt praktisch
+ *              gleich (~19990 statt ~19961ns von +-MIC_OFS_MAX_NS=20000),
+ *              nur die Aufloesung am Ende wird feiner (~9.8ns letzter Schritt
+ *              statt ~39ns).
+ * ============================================================================
+ *
+ *  Rev 4.7.1 – SHOW-Telegramm wurde mit wachsender Parameterzahl wieder zu
+ *              lang und drohte am Puffer (line[600]) abgeschnitten zu
+ *              werden. Netzwerkbezogene Felder (ssid/pass/host/port/
+ *              static_ip/ip/gateway/subnet/dns) sind deshalb in einen neuen
+ *              Befehl SHOWNET (eigenes "type":"confignet"-Telegramm)
+ *              ausgelagert - SHOW enthaelt jetzt nur noch die Auswertungs-/
+ *              Kalibrier-Parameter (lane bleibt dort, da Bahnnummer keine
+ *              Netzwerkeinstellung ist).
+ * ============================================================================
+ *
+ *  Rev 4.7.0 – Neu: Kugeldurchmesser-Korrektur der Stufe-1-Loesung in
+ *              solveAirPosition() (SET BSHIFTPCT/SET BSHIFTCAP). Idee: Das
+ *              Projektil (ca. 4,5mm Durchmesser) strahlt den Einschlags-
+ *              schall nicht exakt aus dem Lochmittelpunkt ab, sondern eher
+ *              von der dem jeweiligen Mikrofon zugewandten Kugeloberflaeche.
+ *              Fuer jedes an der Stufe-1-Loesung NICHT beteiligte
+ *              (verbleibende) Mikrofon wird deshalb aus dem vorzeichen-
+ *              behafteten Rest-Fehler eine Verschiebung Richtung (bzw. weg
+ *              von) diesem Mikrofon abgeleitet, gewichtet mit SET BSHIFTPCT
+ *              (Default 50%) und je Mikrofon gedeckelt auf SET BSHIFTCAP
+ *              (Default 3.0mm). Wirkt nur auf die Stufe-1-Loesung, die
+ *              dadurch automatisch auch als korrigierte Referenz in den
+ *              Verifizierungsschritt (Stufe 2) einfliesst. SET BSHIFTPCT=0
+ *              schaltet die Korrektur ab. Beide Werte in SHOW enthalten.
+ * ============================================================================
+ *
  *  Rev 4.6.1 – Protokoll fuer die Stand-PC-Anzeige entkoppelt von SET DEBUG:
  *              "shot"- und "reject"-Telegramme gehen jetzt IMMER raus (auch
  *              bei Ausreissern/zu wenigen Mics), jede Ausloesung bekommt
@@ -244,6 +522,13 @@
  *    GPIO32 = links mitte     GPIO33 = rechts mitte
  *  Diese Tabelle beschreibt die GPIO-Verkabelung im Normalzustand.
  *
+ *  Pinbelegung Papiervorschub (siehe PAPER_*-Defines/servicePaperStepper()):
+ *    GPIO21 = STEP (Treiber)     GPIO18 = DIR (Treiber)
+ *    GPIO19 = EN (Treiber, aktiv-LOW)
+ *    (GPIO21/18/19 liegen auf dem Devkit nebeneinander, samt GND-Pin daneben)
+ *    GPIO16 = Kippschalter Pos. "vorwaerts" (Einfaedeln)
+ *    GPIO17 = Kippschalter Pos. "rueckwaerts" (Einfaedeln)
+ *
  *  Hardware-Diagnose (Verfolgung einer auffaelligen Zeitabweichung an
  *  Kanal 4/"links mitte"), Verlauf ueber 3 Tests:
  *   1. Mikrofon-Element GPIO27<->GPIO32 getauscht: Abweichung blieb am
@@ -251,11 +536,10 @@
  *   2. LM339-Ausgang GPIO25<->GPIO33 getauscht (dasselbe separate IC wie
  *      GPIO32): alle drei Kanaele auffaellig, GPIO32 aber konsistent am
  *      staerksten. (zurueckgebaut)
- *   3. GPIO32-Signal auf GPIO35 verlegt (dasselbe Signal, anderer ESP32-Pin,
- *      siehe Kommentar bei AIR_PINS[] weiter unten): Abweichung praktisch
- *      unveraendert -> weder Mikrofon-Element noch ESP32-Pin sind die
- *      Ursache, sondern das LM339 (bzw. dessen Beschaltung) dieses einen
- *      Kanals selbst. AKTUELL WEITERHIN AKTIV.
+ *   3. GPIO32-Signal auf GPIO35 verlegt (dasselbe Signal, anderer ESP32-Pin):
+ *      Abweichung praktisch unveraendert -> weder Mikrofon-Element noch
+ *      ESP32-Pin sind die Ursache, sondern das LM339 (bzw. dessen
+ *      Beschaltung) dieses einen Kanals selbst. (zurueckgebaut)
  *
  *  Telegramm:
  *    {"type":"shot","seq":8,"air_ns":[[0,...],[...],[...],[...],[...],[...]],
@@ -389,14 +673,40 @@
 #include <Preferences.h>
 #include <math.h>                 // sqrtf/fabsf/lroundf (Positionsberechnung)
 #include "esp_cpu.h"
+#include "esp_mac.h"               // esp_read_mac() - Basis-MAC als Geraete-ID,
+                                    // unabhaengig vom WLAN-Zustand (siehe deviceMac)
+#include <mbedtls/md.h>            // HMAC-SHA256 fuer die TCP-Authentifizierung
+                                    // (siehe AUTH_PSK_DEFAULT_HEX/computeAuthTag) -
+                                    // im ESP32-Arduino-Core bereits enthalten,
+                                    // Hardware-SHA-Beschleunigung -> vernachlaessigbare
+                                    // Rechenlast, KEIN TLS-Handshake pro Verbindung
 
 // ---------------------------------------------------------------------------
 // Konstanten & Werks-Defaults (greifen nur bei leerem NVS)
 // ---------------------------------------------------------------------------
 
-#define FW_VERSION   "4.6.1"
+#define FW_VERSION   "4.10.1"
 #define SERIAL_BAUD  115200
 #define NVS_NS       "schiessstd"     // NVS-Namespace
+
+// Anlagenweiter Pre-Shared Key fuer die HMAC-Authentifizierung der
+// TCP-Verbindung zum Stand-PC (Serial bleibt bewusst unauthentifiziert -
+// physischer Kabelzugriff ist dort schon die Absicherung, siehe
+// verifyIncomingIfTcp()/emitLine()). Leer = Feature aus (Rueckwaertskompatibel
+// fuer einen risikofreien Rollout). Fuer den Produktivbetrieb EINMAL PRO
+// ANLAGE einen Schluessel erzeugen (z.B. "openssl rand -hex 32"), hier
+// eintragen und alle ESP32 dieser Anlage mit demselben Firmware-Image
+// flashen - ein Ersatzgeraet ist dann ohne weiteres Pairing sofort
+// einsatzbereit. Kann spaeter ueber "SET PSK=<64 Hex-Zeichen>" (authentifiziert
+// mit dem noch gueltigen Schluessel, oder unauthentifiziert ueber Serial)
+// rotiert werden - der neue Wert wird in NVS persistiert und hat dann
+// Vorrang vor diesem Default.
+#define AUTH_PSK_DEFAULT_HEX  "df07c9827321073c62f4edd830aa8b6adbac934a126605b25b33006c03fb2c9f"
+
+// Zeitfenster nach einem Boot mit ausstehender Netzwerk-Bestaetigung (siehe
+// armNetWatchdogIfNeeded()/serviceNetWatchdog()), bevor die zuletzt
+// bestaetigte Netzwerkkonfiguration automatisch wiederhergestellt wird.
+#define NET_CONFIRM_TIMEOUT_MS  180000UL   // 3 Minuten
 
 // Luft-Mikrofone: LM339-Frontend, 3 pro Seitenwand (links/rechts)
 #define NUM_AIR        6
@@ -404,22 +714,10 @@
 // Reihenfolge: 0=links unten 1=rechts unten 2=links oben 3=rechts oben
 //              4=links mitte 5=rechts mitte  (siehe MIC_X/MIC_Y weiter unten)
 //
-// TEMPORAERE DIAGNOSE-ANPASSUNG (3. Hardware-Test, siehe ausfuehrlichen
-// Verlauf im Header-Kommentar ganz oben): Index 4 (bisher GPIO32, in den
-// ersten beiden Tests durchgehend als auffaellig identifiziert) wurde per
-// Umverkabelung auf GPIO35 verlegt - DASSELBE Signal (LM339-Ausgang,
-// dieselbe Mikrofon-Kette wie bisher), nur ueber einen anderen ESP32-Pin.
-// Geometrie (MIC_X[4]/MIC_Y[4]) bleibt UNVERAENDERT (gleiches Signal,
-// gleiche Herkunft). Die Tests 1 (Mikrofon-Tausch GPIO27/32) und 2 (LM339-
-// Ausgang-Tausch GPIO25/33) sind beide zurueckgebaut. Ergebnis von Test 3:
-// GPIO35 zeigt dieselbe Auffaelligkeit wie zuvor GPIO32 -> weder Mikrofon-
-// Element noch ESP32-Pin sind die Ursache, sondern das LM339 dieses Kanals
-// selbst. WICHTIG: GPIO35 hat (wie GPIO34/Piezo) KEINEN internen Pull-Up -
-// siehe Sonderbehandlung in setup() weiter unten (durch den vom Nutzer
-// bestaetigten externen 10kOhm-Pull-Up an allen Kanaelen unkritisch).
-// Rueckgaengig machen: AIR_PINS[4] wieder auf 32 setzen und die Pin-Mode-
-// Sonderbehandlung fuer 35 in setup() entfernen.
-static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 35, 33};
+// Diagnose-Test 3 (GPIO32->GPIO35, siehe Rev-4.4.8-Hinweis im Header-
+// Kommentar ganz oben) ist zurueckgebaut - Index 4 wieder auf GPIO32 (Tests
+// 1/2 waren bereits vorher zurueckgebaut, siehe Rev 4.4.7/4.4.9).
+static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 32, 33};
 
 // Optionales Piezo-Kontaktmikrofon (Koerperschall) auf der Stahlplatte,
 // dient als Trigger-Bestaetigung gegen verfrueh durch den Muendungsknall
@@ -427,6 +725,83 @@ static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 35, 33};
 // GPIO34 hat KEINEN internen Pull-Up/Down (ESP32 GPIO 34-39) - das
 // Piezo-Modul muss push-pull treiben (uebliche LM393-Komparator-Module tun das).
 #define PIEZO_PIN  34
+
+// Papiervorschub (NEMA17-Schrittmotor, 1,8 Grad/Schritt = 200 Vollschritte/
+// Umdrehung, ueber TMC2209-Treiberboard, per MS1/MS2 im Werkszustand auf
+// 1/8-Microstepping = 1600 Schritte/Umdrehung, siehe PAPER_STEPS_PER_REV
+// unten) - zieht die Papierrolle hinter dem Zentrum der Scheibe nach jedem
+// Schuss ein Stueck weiter, siehe servicePaperStepper()/startPaperFeed()
+// weiter unten. STEP/DIR sind die ueblichen Treiber-Logiksignale, EN ist
+// beim TMC2209 (wie bei DRV8825/A4988) aktiv-LOW
+// (LOW = Endstufe aktiv/Haltemoment, HIGH = hochohmig/aus).
+// GPIO21/18/19 liegen auf dem ESP32-Devkit nebeneinander (samt GND-Pin in der
+// Naehe) - praktisch fuer die 3 Treiber-Leitungen an einem Stecker.
+// (GPIO5 war urspruenglich STEP, ist aber als Strapping-Pin fuer das
+// STEP-Signal ungeeignet - siehe Rev-Historie oben - daher auf GPIO21 verlegt.)
+#define PAPER_STEP_PIN     21
+#define PAPER_DIR_PIN      18
+#define PAPER_EN_PIN       19
+// 2 Positionen eines Kippschalters (kein Mittel-Aus) fuer den manuellen
+// Dauerbetrieb beim Einfaedeln der Rolle - je Pin gegen GND schaltend,
+// daher INPUT_PULLUP (aktiv = LOW). Liegt an KEINEM oder (sollte normalerweise
+// nicht vorkommen) an BEIDEN Pins ein Signal an, wird sicherheitshalber
+// gestoppt statt eine Richtung zu vermuten, siehe servicePaperStepper().
+#define PAPER_SW_FWD_PIN   16
+#define PAPER_SW_REV_PIN   17
+
+// Standbeleuchtung (LED): geht beim Booten sofort an (siehe setup()) und
+// zeigt danach den TCP-Verbindungsstatus zum Host an - bleibt waehrend der
+// ersten LIGHT_GRACE_MS an, um dem Verbindungsaufbau Zeit zu geben, geht
+// danach aus falls bis dahin keine TCP-Session steht, und folgt anschliessend
+// live tcp.connected() (siehe serviceLight() weiter unten).
+// Zur Fehlereingrenzung (WLAN ok, aber Host/TCP nicht erreichbar?) blinkt die
+// LED LIGHT_BLINK_DELAY_MS nach dem Abschalten einmal fuer LIGHT_BLINK_
+// DURATION_MS kurz auf, sofern zu dem Zeitpunkt eine WLAN-Verbindung steht -
+// danach bleibt sie endgueltig aus, bis tcp.connected() wieder true wird.
+#define LIGHT_PIN               22
+#define LIGHT_GRACE_MS          10000
+#define LIGHT_BLINK_DELAY_MS    1000
+#define LIGHT_BLINK_DURATION_MS 1000
+
+// Mechanik: 200 Vollschritte/Umdrehung (1,8 Grad/Schritt), TMC2209 laeuft
+// mit MS1/MS2 im Werkszustand (unbeschaltet) auf 1/8-Microstepping, also
+// 200 * 8 = 1600 Schritte/Umdrehung. Falls MS1/MS2 spaeter fest verdrahtet
+// oder per UART auf eine andere Aufloesung gestellt werden, muss diese
+// Konstante entsprechend angepasst werden (siehe Rev-4.8.8-Hinweis oben) -
+// sonst stimmt der ueber SET PAPERFEED/PAPERSPEED eingestellte mm-Wert nicht
+// mehr mit dem tatsaechlichen Vorschub ueberein.
+// 50,2mm Papiervorschub je Umdrehung.
+#define PAPER_STEPS_PER_REV   1600
+#define PAPER_MM_PER_REV      50.2f
+#define PAPER_STEPS_PER_MM    (PAPER_STEPS_PER_REV / PAPER_MM_PER_REV)
+// STEP-Impuls: High-Zeit ist die HALBE aktuelle Schrittperiode (50% Tastgrad,
+// siehe paperStepRise()) statt eines festen, fuer den Treiber selbst voellig
+// ausreichenden Kurzimpulses - damit ist z.B. eine an GPIO21 angeklemmte LED
+// bei niedrigen Geschwindigkeiten (SET PAPERJOGSPEED/PAPERSPEED) tatsaechlich
+// als Blinken sichtbar. PAPER_STEP_PULSE_MIN_US ist nur die untere Grenze
+// dafuer (TMC2209 wie DRV8825/A4988 brauchen laut Datenblatt << 1us).
+#define PAPER_STEP_PULSE_MIN_US   4
+
+// Geschwindigkeitsprofil des automatischen Vorschubs (SET PAPERSPEED, siehe
+// servicePaperStepper()): erste Haelfte der Strecke konstant, zweite Haelfte
+// linear abfallend, damit die Papierrolle durch ihre eigene Massentraegheit
+// am Ende nicht nachlaeuft/uebersteuert. PAPER_MIN_SPEED_MMPS verhindert bei
+// sehr niedrig eingestellter SET PAPERSPEED ein unpraktikabel langsames Ende.
+#define PAPER_DECEL_END_FRACTION  0.3f
+#define PAPER_MIN_SPEED_MMPS      0.5f
+// Geschwindigkeit fuer den manuellen Dauerbetrieb (Einfaedeln, SET
+// PAPERJOGSPEED) - eigener Parameter statt cfg.paperSpeedMmS, da beim
+// Einfaedeln Zuegigkeit statt der fuer den Schuss-Vorschub gewaehlten
+// Praezisions-Geschwindigkeit gewuenscht ist. Kein Beschleunigungsprofil wie
+// beim automatischen Vorschub - der Motor startet direkt mit voller
+// Geschwindigkeit, bei sehr hoch eingestelltem PAPERJOGSPEED ist daher ein
+// Anlaufverlust (verlorene Schritte) moeglich.
+#define PAPER_JOG_SPEED_MIN_MMPS  1.0f
+#define PAPER_JOG_SPEED_MAX_MMPS  100.0f
+
+#define PAPER_TRIG_ANY    0    // Vorschub bei JEDER Ausloesung (auch reject)
+#define PAPER_TRIG_PIEZO  1    // nur wenn das Piezo ausgeloest hat (Default)
+#define PAPER_TRIG_CLEAN  2    // nur bei "clean"-Schuessen (alle Qualitaetsschwellen)
 
 // Messmodus (SET TARGET, siehe applyTargetGeometry() weiter unten): legt
 // fest, welches Geometrie-Preset (Mic-Y-Abstand/Standoff) verwendet wird -
@@ -485,6 +860,18 @@ struct DeviceConfig {
                             // im STEEL-Modus (SET STANDOFFSTEEL, Default 30.0)
     float    standoffPaperMm; // Wie standoffSteelMm, fuer PAPER-Modus
                             // (SET STANDOFFPAPER, Default 28.0)
+    float    micHalfXMm;   // Horizontaler Abstand Mic-Spalte<->Mittellinie in
+                            // mm, fuer STEEL UND PAPER gleich (SET MICHALFX,
+                            // Default 115.0) - deckt z.B. ab, dass die Membran
+                            // 1-2mm hinter der aeusseren Mic-Huelle liegt
+    uint8_t  bulletShiftPct; // Kugeldurchmesser-Korrektur (siehe
+                            // solveAirPosition()): Gewichtung 0-100% des
+                            // signierten Rest-Fehlers der Stufe-1-Loesung
+                            // gegen die daran nicht beteiligten Mikrofone,
+                            // als Verschiebung Richtung/weg vom jeweiligen
+                            // Mikrofon (SET BSHIFTPCT, Default 50, 0=aus)
+    float    bulletShiftCapMm; // Kappung der Kugeldurchmesser-Korrektur je
+                            // Mikrofon in mm (SET BSHIFTCAP, Default 3.0)
     bool     usePiezo;      // Piezo (Stahlplatte, PIEZO_PIN) als Trigger-
                             // Bestaetigung nutzen? (SET PIEZO, Default 1/an)
     uint32_t piezoMinUs;    // Erwartete min. Verzoegerung Piezo nach erstem
@@ -505,20 +892,56 @@ struct DeviceConfig {
                             // (SET SOUNDSPEED, Default 355, wird auch von
                             // CAL START mitkalibriert) - siehe
                             // applySoundSpeed()
+    float    paperFeedMm;  // Papiervorschub je Schuss in mm (SET PAPERFEED,
+                            // 10.0-100.0, Default 50.0)
+    float    paperSpeedMmS; // Vorschub-Geschwindigkeit in mm/s, gilt fuer
+                            // die erste Haelfte der Strecke (SET PAPERSPEED,
+                            // 0.5-30.0, Default 5.0) - siehe
+                            // servicePaperStepper() fuer das Abbrems-Profil
+                            // in der zweiten Haelfte
+    bool     paperAuto;    // Automatischen Vorschub nach einer Ausloesung
+                            // ueberhaupt durchfuehren? (SET PAPERAUTO,
+                            // Default 1/an) - 0 z.B. fuer Testschuesse/
+                            // Kalibrierung ohne Papierverbrauch
+    uint8_t  paperTrigger; // Wann der automatische Vorschub ausloest
+                            // (SET PAPERTRIGGER=ANY|PIEZO|CLEAN, Default
+                            // PIEZO) - siehe PAPER_TRIG_*-Defines oben
+    bool     paperDirInvert; // Vorschub-Drehrichtung invertieren (SET
+                            // PAPERDIR=0|1, Default 1) - gleicht eine beim
+                            // Anschluss vertauschte Motorwicklung/Kabel-
+                            // Reihenfolge aus, ohne die Hardware zu aendern.
+                            // Default 1 (invertiert), da die unveraenderte
+                            // DIR-Polaritaet (0) beim TMC2209 in Testmode-
+                            // Messungen rueckwaerts statt vorwaerts lief.
+    float    paperJogSpeedMmS; // Geschwindigkeit fuer den manuellen Dauer-
+                            // betrieb (Einfaedeln) in mm/s (SET
+                            // PAPERJOGSPEED, PAPER_JOG_SPEED_MIN_MMPS-
+                            // PAPER_JOG_SPEED_MAX_MMPS, Default 75.0 =
+                            // 5x der urspruenglichen fest einkompilierten
+                            // 15.0 mm/s - war fuers Einfaedeln zu langsam)
     // Netzwerk: statische IP (staticIP=false → DHCP)
     bool     staticIP;
     String   ip;
     String   gateway;
     String   subnet;
     String   dns;           // "" → Gateway als DNS verwenden
+    String   pskHex;        // TCP-Authentifizierung, siehe AUTH_PSK_DEFAULT_HEX
+                            // (SET PSK) - "" = Signieren/Pruefen aus
 };
 
 static DeviceConfig cfg;
 static Preferences  prefs;
 
+// true, wenn beim letzten Boot ein "net_pnd"-Flag im NVS vorgefunden wurde
+// (siehe armNetWatchdogIfNeeded()/serviceNetWatchdog()) - eine Netzwerk-
+// Aenderung wartet dann noch auf NET CONFIRM bzw. auf den automatischen
+// Ruecksprung nach NET_CONFIRM_TIMEOUT_MS.
+static bool netPendingLoaded = false;
+
 static void loadConfig()
 {
     prefs.begin(NVS_NS, /*readOnly=*/true);
+    netPendingLoaded = prefs.getBool("net_pnd", false);
     cfg.ssid       = prefs.getString("ssid", "");
     cfg.pass       = prefs.getString("pass", "");
     cfg.host       = prefs.getString("host", "192.168.1.10");
@@ -544,6 +967,12 @@ static void loadConfig()
     cfg.targetMode = prefs.getUChar("target", TARGET_STEEL);
     cfg.standoffSteelMm = prefs.getFloat("standoff_st", 30.0f);
     cfg.standoffPaperMm = prefs.getFloat("standoff_pa", 28.0f);
+    // Literal statt MIC_HALF_X-Makro: das Makro ist erst weiter unten im
+    // File definiert (siehe dortigen Kommentar zu STANDOFFSTEEL/-PAPER, wo
+    // derselbe Reihenfolge-Fallstrick schon einmal aufgetreten ist).
+    cfg.micHalfXMm = prefs.getFloat("mic_half_x", 115.0f);
+    cfg.bulletShiftPct = prefs.getUChar("bshift_pct", 50);
+    cfg.bulletShiftCapMm = prefs.getFloat("bshift_cap", 3.0f);
     cfg.usePiezo   = prefs.getBool("use_piezo", true);
     cfg.piezoMinUs = prefs.getUInt("piezo_min", 100);
     cfg.piezoMaxUs = prefs.getUInt("piezo_max", 1400);
@@ -551,12 +980,20 @@ static void loadConfig()
     cfg.offsetXUm = prefs.getInt("ofs_x_um", 0);
     cfg.offsetYUm = prefs.getInt("ofs_y_um", 0);
     cfg.soundSpeedMps = prefs.getUShort("sound_mps", 355);
+    cfg.paperFeedMm   = prefs.getFloat("paper_mm", 50.0f);
+    cfg.paperSpeedMmS = prefs.getFloat("paper_mmps", 5.0f);
+    cfg.paperAuto     = prefs.getBool("paper_auto", true);
+    cfg.paperTrigger  = prefs.getUChar("paper_trig", PAPER_TRIG_PIEZO);
+    cfg.paperDirInvert = prefs.getBool("paper_dir", true);
+    cfg.paperJogSpeedMmS = prefs.getFloat("paper_jog", 75.0f);
     cfg.staticIP   = prefs.getBool("static_ip", false);
     cfg.ip         = prefs.getString("ip", "");
     cfg.gateway    = prefs.getString("gateway", "");
     cfg.subnet     = prefs.getString("subnet", "255.255.255.0");
     cfg.dns        = prefs.getString("dns", "");
+    cfg.pskHex     = prefs.getString("psk", AUTH_PSK_DEFAULT_HEX);
     prefs.end();
+    applyPskHex(cfg.pskHex);
 }
 
 // Einzelnen Wert persistieren (oeffnet kurz schreibend)
@@ -579,6 +1016,143 @@ template <> void saveVal<float>(const char *key, float v)
 { prefs.begin(NVS_NS, false); prefs.putFloat(key, v); prefs.end(); }
 
 // ---------------------------------------------------------------------------
+// TCP-Authentifizierung (HMAC-SHA256, siehe AUTH_PSK_DEFAULT_HEX oben) -
+// Wire-Format: "<16-Hex-Zeichen-Tag> <Zeile>\n". Der Tag sind die ersten
+// 8 Byte (64 Bit) von HMAC-SHA256(psk, Zeile) - fuer dieses Bedrohungsmodell
+// (LAN-Angreifer, kein staatlicher Akteur) ausreichend und haelt den
+// Overhead klein (die eingehende Kommandozeile ist auf AUTH_CMD_BUF_LEN
+// begrenzt, siehe pollCommands()).
+// ---------------------------------------------------------------------------
+#define AUTH_TAG_HEX_LEN  16   // 8 Byte Tag, hex-kodiert
+static uint8_t authPskBytes[32];
+static size_t  authPskLen = 0;   // 0 = kein Schluessel konfiguriert -> Feature aus
+
+static int hexNibble(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+// applyPskHex dekodiert einen Hex-String in authPskBytes/authPskLen - bei
+// ungueltiger Laenge/ungueltigen Zeichen wird der Schluessel deaktiviert
+// (authPskLen=0), damit ein Tippfehler nicht zu einem stillen Sicherheits-
+// versagen (z.B. falscher, aber "gueltiger" Schluessel) fuehrt, sondern das
+// Geraet erkennbar unauthentifiziert bleibt (SHOWNET/STATUS zeigen das nicht
+// direkt an, aber jede TCP-Zeile wird dann unsigniert - fuer den Rollout,
+// siehe Dateikopf, ist das der bewusst gewaehlte sichere Fallback).
+static void applyPskHex(const String &hex)
+{
+    authPskLen = 0;
+    if (hex.length() != sizeof(authPskBytes) * 2) return;
+    for (size_t i = 0; i < sizeof(authPskBytes); i++) {
+        int hi = hexNibble(hex[2 * i]);
+        int lo = hexNibble(hex[2 * i + 1]);
+        if (hi < 0 || lo < 0) return;
+        authPskBytes[i] = (uint8_t)((hi << 4) | lo);
+    }
+    authPskLen = sizeof(authPskBytes);
+}
+
+// computeAuthTag berechnet den Tag ueber [data,len) und schreibt ihn als
+// AUTH_TAG_HEX_LEN+1 Hex-Zeichen (inkl. Nullterminator) nach out.
+static void computeAuthTag(const uint8_t *data, size_t len, char *out)
+{
+    uint8_t full[32];   // SHA256-Ausgabe, wir nutzen nur die ersten 8 Byte
+    mbedtls_md_context_t ctx;
+    mbedtls_md_init(&ctx);
+    mbedtls_md_setup(&ctx, mbedtls_md_info_from_type(MBEDTLS_MD_SHA256), 1 /*hmac*/);
+    mbedtls_md_hmac_starts(&ctx, authPskBytes, authPskLen);
+    mbedtls_md_hmac_update(&ctx, data, len);
+    mbedtls_md_hmac_finish(&ctx, full);
+    mbedtls_md_free(&ctx);
+    static const char hexDigits[] = "0123456789abcdef";
+    for (int i = 0; i < AUTH_TAG_HEX_LEN / 2; i++) {
+        out[2 * i]     = hexDigits[full[i] >> 4];
+        out[2 * i + 1] = hexDigits[full[i] & 0x0F];
+    }
+    out[AUTH_TAG_HEX_LEN] = '\0';
+}
+
+// verifyIncomingIfTcp prueft (nur wenn viaTcp und ein Schluessel konfiguriert
+// ist) das Tag-Praefix einer eingehenden Zeile und liefert bei Erfolg true
+// mit auf die Nutzlast gekuerztem line zurueck. Ohne konfigurierten
+// Schluessel oder ueber Serial: immer true, line unveraendert (siehe
+// Dateikopf zu AUTH_PSK_DEFAULT_HEX).
+static bool verifyIncomingIfTcp(String &line, bool viaTcp)
+{
+    if (!viaTcp || authPskLen == 0) return true;
+    if (line.length() <= AUTH_TAG_HEX_LEN || line[AUTH_TAG_HEX_LEN] != ' ') return false;
+    String tag     = line.substring(0, AUTH_TAG_HEX_LEN);
+    String payload = line.substring(AUTH_TAG_HEX_LEN + 1);
+    char want[AUTH_TAG_HEX_LEN + 1];
+    computeAuthTag((const uint8_t *)payload.c_str(), payload.length(), want);
+    // Konstant-Zeit-Vergleich (Timing-Seitenkanal) statt tag.equals(want).
+    uint8_t diff = 0;
+    for (int i = 0; i < AUTH_TAG_HEX_LEN; i++) diff |= (uint8_t)(tag[i] ^ want[i]);
+    if (diff != 0) return false;
+    line = payload;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Geraete-ID (Basis-MAC) - siehe Rev-4.9.0-Hinweis oben
+// ---------------------------------------------------------------------------
+// Per esp_read_mac() direkt aus dem Werks-Efuse gelesen statt ueber
+// WiFi.macAddress() - dadurch unabhaengig davon, ob/wann der WLAN-Treiber
+// initialisiert wird (bei leerer SET SSID bleibt WiFi.mode() unaufgerufen).
+// In status/config/confignet/cal-Telegrammen als "mac" enthalten, damit der
+// Stand-PC Konfiguration/Kalibrierung einem physischen Geraet zuordnen kann,
+// unabhaengig von der (frei vergebbaren) SET LANE-Bahnnummer.
+static char deviceMac[18] = "00:00:00:00:00:00";
+
+static void initDeviceMac()
+{
+    uint8_t mac[6];
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(deviceMac, sizeof(deviceMac), "%02X:%02X:%02X:%02X:%02X:%02X",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
+// ---------------------------------------------------------------------------
+// Sicherheitsnetz fuer Netzwerk-Fernkonfiguration (siehe Rev-4.9.0-Hinweis
+// oben, Konzept docs/remote-interaktion-konzept.md Abschnitt 5.2)
+// ---------------------------------------------------------------------------
+// netSnapshotArmedThisBoot verhindert, dass mehrere SET SSID/HOST/...-Aufrufe
+// innerhalb desselben (noch unbestaetigten) Boot-Zyklus die "*_prv"-Werte
+// wiederholt ueberschreiben - sie sollen immer die zuletzt BESTAETIGTE
+// Konfiguration festhalten, nicht eine zwischenzeitliche, selbst noch nicht
+// bestaetigte Aenderung. Wird in setup() anhand von netPendingLoaded
+// vorbelegt (siehe dort) und bei NET CONFIRM wieder freigegeben.
+static bool     netSnapshotArmedThisBoot = false;
+static bool     netWatchdogArmed         = false;
+static uint32_t netWatchdogDeadlineMs    = 0;
+
+// Sichert die AKTUELL GUELTIGEN Netzwerkwerte als Ruecksprungpunkt, bevor der
+// erste Netzwerk-SET-Befehl dieses Boot-Zyklus sie ueberschreibt. Muss vor
+// dem Schreiben des neuen Werts aufgerufen werden (siehe Aufrufstellen in
+// handleSet()).
+static void armNetWatchdogIfNeeded()
+{
+    if (netSnapshotArmedThisBoot) return;
+    prefs.begin(NVS_NS, false);
+    prefs.putString("ssid_prv", cfg.ssid);
+    prefs.putString("pass_prv", cfg.pass);
+    prefs.putString("host_prv", cfg.host);
+    prefs.putUShort("port_prv", cfg.port);
+    prefs.putBool("static_prv", cfg.staticIP);
+    prefs.putString("ip_prv", cfg.ip);
+    prefs.putString("gw_prv", cfg.gateway);
+    prefs.putString("subnet_prv", cfg.subnet);
+    prefs.putString("dns_prv", cfg.dns);
+    prefs.putBool("net_pnd", true);
+    prefs.end();
+    netSnapshotArmedThisBoot = true;
+    netPendingLoaded         = true;   // fuer sendShowNetConfig() diesen Boot bereits sichtbar
+}
+
+// ---------------------------------------------------------------------------
 // Schusserfassung – Luftschall-Mikrofone (Multi-Edge-Capture)
 // ---------------------------------------------------------------------------
 
@@ -589,6 +1163,15 @@ static volatile uint64_t lockoutUntil = 0;
 
 static uint32_t shotCounter = 0;
 static uint32_t sequenceNo  = 0;
+
+// TESTSHOOT (siehe handleTestShoot()/processShot()): markiert den NAECHSTEN
+// von processShot() ausgewerteten Treffer als synthetisch erzeugt - fuehrt
+// zu einem zusaetzlichen "synthetic":1-Feld im shot/reject-Telegramm, damit
+// der Stand-PC einen Testschuss (z.B. um ihn NICHT in eine echte Wertung zu
+// uebernehmen) von einem echten Treffer unterscheiden kann. Wird von
+// processShot() sofort nach dem Lesen wieder auf false gesetzt.
+static bool syntheticShotPending = false;
+
 static uint32_t cpuMHz      = 240;   // wird in setup() ermittelt
 
 // Timing-Offset-Kalibrierung (siehe CAL START / runCalibration() weiter
@@ -639,7 +1222,7 @@ static bool     testSeriesActive   = false;
 // (voriger Diagnosetausch dort zurueckgebaut).
 static const char *TEST_SENSOR_NAMES[NUM_AIR + 1] = {
     "AIR0 links-unten", "AIR1 rechts-unten", "AIR2 links-oben",
-    "AIR3 rechts-oben",  "AIR4 links-mitte(GPIO35!)",  "AIR5 rechts-mitte",
+    "AIR3 rechts-oben",  "AIR4 links-mitte",  "AIR5 rechts-mitte",
     "PIEZO stahlplatte",
 };
 
@@ -738,8 +1321,29 @@ static bool       wifiEnabled = false;
 static uint32_t   nextConnectAttemptMs = 0;
 static uint32_t   connectBackoffMs = 1000;
 
+// Zustandsautomat der Standbeleuchtung, siehe serviceLight() weiter unten:
+// LP_WAIT_CONN = an, wartet auf TCP-Verbindung (Boot oder nach Verbindungs-
+//                verlust erneut durchlaufen);
+// LP_OFF_WAIT  = aus, wartet LIGHT_BLINK_DELAY_MS ab, ob geblinkt wird;
+// LP_BLINK     = kurz an (Diagnose-Blink bei bestehendem WLAN);
+// LP_OFF_DONE  = endgueltig aus, bis wieder tcp.connected().
+enum LightPhase : uint8_t { LP_WAIT_CONN, LP_OFF_WAIT, LP_BLINK, LP_OFF_DONE };
+static LightPhase lightPhase = LP_WAIT_CONN;
+static uint32_t   lightPhaseMs = 0;
+static bool       lightWasConnected = false;
+
+// ACTION LIGHT=ON|OFF|AUTO (siehe handleActionCommand()): uebersteuert die
+// automatische Verbindungsanzeige oben. NICHT NVS-persistent (wie SET
+// TESTMODE) - nach einem Reboot ist die Anzeige immer wieder LIGHT_AUTO,
+// damit ein vergessenes ACTION LIGHT=OFF sie nicht dauerhaft lahmlegt.
+enum LightOverride : uint8_t { LIGHT_AUTO, LIGHT_FORCE_ON, LIGHT_FORCE_OFF };
+static LightOverride lightOverride = LIGHT_AUTO;
+
 #define TXBUF_SLOTS 64
-#define TXBUF_LINE  320
+#define TXBUF_LINE  360   // 320 + Reserve fuer das Auth-Signatur-Praefix (siehe emitLine) -
+                          // gilt nur noch als Kapazitaet des Offline-Ringpuffers (txBufPush)
+                          // und des emitf()-Formatpuffers, NICHT mehr als Laengengrenze fuers
+                          // Signieren selbst (siehe Bugfix-Kommentar in emitLine())
 static char    txBuf[TXBUF_SLOTS][TXBUF_LINE];
 static uint8_t txHead = 0, txTail = 0;
 
@@ -754,6 +1358,16 @@ static void txBufPush(const char *line)
     txHead = (txHead + 1) % TXBUF_SLOTS;
 }
 
+// Waehrend handleCommand() einen Befehl mit " #<id>"-Suffix verarbeitet (siehe
+// dortiges Parsing), haengt emitLine() den Wert als zusaetzliches "corr"-Feld
+// an JEDE waehrend dieses einen Aufrufs gesendete JSON-Zeile an - das deckt
+// sowohl den Normalfall (genau eine ok/error-Antwort) als auch z.B. CAL START
+// ab. pollCommands() setzt den Wert direkt nach dem Aufruf wieder auf -1
+// zurueck, damit spaeter (asynchron aus loop()) gesendete Telegramme
+// (shot/status/...) NICHT versehentlich eine laengst abgearbeitete
+// Korrelations-ID tragen. -1 = kein Befehl mit Suffix in Bearbeitung.
+static long pendingCorrId = -1;
+
 static void emitLine(const char *line)
 {
     // Trailer des Aufrufers (falls vorhanden) abschneiden und einheitlich
@@ -765,10 +1379,43 @@ static void emitLine(const char *line)
     size_t len = strlen(line);
     while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r')) len--;
 
+    // Korrelations-ID einfuegen (siehe pendingCorrId oben): nur moeglich,
+    // wenn die Zeile mit "}" endet (jede JSON-Telegrammzeile dieser Firmware
+    // tut das) und in den Hilfspuffer passt - waehrend der Befehlsverarbeitung
+    // werden ausschliesslich kurze ok/error/cal/pin-Zeilen gesendet, nie die
+    // deutlich laengeren shot/config-Zeilen, daher reicht ein kleiner Puffer.
+    char corrBuf[160];
+    if (pendingCorrId >= 0 && len > 0 && line[len - 1] == '}'
+        && len < sizeof(corrBuf) - 24) {
+        int n = snprintf(corrBuf, sizeof(corrBuf), "%.*s,\"corr\":%ld}",
+                          (int)(len - 1), line, pendingCorrId);
+        line = corrBuf;
+        len  = (size_t)n;
+    }
+
     Serial.write((const uint8_t *)line, len);
     Serial.print("\r\n");
 
     if (!wifiEnabled) return;
+
+    // TCP-Ausgang signieren, falls ein Schluessel konfiguriert ist (Serial
+    // oben bleibt bewusst UNSIGNIERT, siehe Dateikopf zu AUTH_PSK_DEFAULT_HEX).
+    // Bis Rev 4.10.0 wurden Tag+Zeile erst in einen gemeinsamen, auf
+    // TXBUF_LINE begrenzten Kopierpuffer geschrieben - dadurch blieben lange
+    // Telegramme (v.a. "config", das in einem eigenen 900-Byte-Puffer gebaut
+    // und per emitLine() direkt verschickt wird, siehe sendShowConfig())
+    // FAST IMMER unsigniert, obwohl ein Schluessel konfiguriert war (Bug).
+    // Fix: bei bestehender TCP-Verbindung Tag und Zeile als ZWEI getrennte
+    // tcp.write()-Aufrufe senden - TCP ist ein Bytestrom, fuer den Empfaenger
+    // nicht von einem einzelnen Aufruf zu unterscheiden, dafuer entfaellt
+    // jede Laengenbegrenzung durch einen Zwischenpuffer. Nur fuer den
+    // Offline-Ringpuffer (txBufPush(), ausschliesslich fuer shot/reject bei
+    // fehlender TCP-Verbindung) wird weiterhin EIN zusammenhaengender String
+    // gebraucht, dort gilt unveraendert die (bereits grosszuegig bemessene)
+    // TXBUF_LINE-Kapazitaet als Obergrenze - siehe dortigen Kommentar.
+    char authTag[AUTH_TAG_HEX_LEN + 1];
+    const bool signOutgoing = (authPskLen > 0);
+    if (signOutgoing) computeAuthTag((const uint8_t *)line, len, authTag);
 
     if (tcp.connected()) {
         while (!txBufEmpty() && tcp.connected()) {
@@ -776,13 +1423,23 @@ static void emitLine(const char *line)
             txTail = (txTail + 1) % TXBUF_SLOTS;
         }
         if (tcp.connected()) {
+            if (signOutgoing) {
+                tcp.write((const uint8_t *)authTag, AUTH_TAG_HEX_LEN);
+                tcp.write((const uint8_t *)" ", 1);
+            }
             tcp.write((const uint8_t *)line, len);
             tcp.print('\n');
             return;
         }
     }
     if (strstr(line, "\"type\":\"shot\"") || strstr(line, "\"type\":\"reject\"")) {
-        txBufPush(line);
+        if (signOutgoing) {
+            char signedBuf[TXBUF_LINE];
+            snprintf(signedBuf, sizeof(signedBuf), "%s %s", authTag, line);
+            txBufPush(signedBuf);
+        } else {
+            txBufPush(line);
+        }
     }
 }
 
@@ -802,18 +1459,16 @@ static void emitf(const char *fmt, ...)
 
 static void sendStatus()
 {
-    char ip[20] = "none";
-    if (wifiEnabled && WiFi.status() == WL_CONNECTED) {
-        snprintf(ip, sizeof(ip), "%s", WiFi.localIP().toString().c_str());
-    }
-    emitf("{\"type\":\"status\",\"version\":\"%s\",\"lane\":%u,"
+    // wifi/tcp-Verbindungsstatus sind seit Rev 4.7.4 Teil von SHOWNET
+    // (sendShowNetConfig(), Felder wifi_ip/tcp_connected) statt hier -
+    // gehoeren inhaltlich zur Netzwerkseite, nicht zum Auswertungs-Status.
+    emitf("{\"type\":\"status\",\"version\":\"%s\",\"mac\":\"%s\",\"lane\":%u,"
           "\"uptime_s\":%llu,\"shots\":%u,\"window_ms\":%u,"
-          "\"debounce_ms\":%u,\"mics\":%d,\"wifi\":\"%s\",\"tcp\":%s,"
+          "\"debounce_ms\":%u,\"mics\":%d,"
           "\"buffered\":%u,\"test_mode\":%d}\n",
-          FW_VERSION, cfg.lane,
+          FW_VERSION, deviceMac, cfg.lane,
           (unsigned long long)(esp_timer_get_time() / 1000000ULL),
           shotCounter, cfg.windowMs, cfg.debounceMs, NUM_AIR,
-          ip, tcp.connected() ? "true" : "false",
           (unsigned)((txHead - txTail + TXBUF_SLOTS) % TXBUF_SLOTS),
           testMode ? 1 : 0);
 }
@@ -830,38 +1485,312 @@ static void sendShowConfig()
     }
     // Eigener, grosszuegig bemessener Puffer statt emitf() (dessen interner
     // Puffer nur TXBUF_LINE=320 Byte fasst) - die SHOW-Zeile ist mit allen
-    // Feldern (SSID/Host/IP/Offsets/Piezo/...) laenger und wuerde sonst
-    // stillschweigend abgeschnitten.
-    char line[600];
+    // Feldern laenger und wuerde sonst stillschweigend abgeschnitten. Die
+    // Netzwerk-Felder (SSID/Pass/Host/IP/...) sind seit Rev 4.7.1 in einer
+    // eigenen SHOWNET-Zeile ausgelagert (siehe sendShowNetConfig()). Trotzdem
+    // reichte 500 Byte (Rev 4.7.1-4.7.3) nicht mehr aus (Rev 4.7.3 kam mit
+    // mic_half_x_mm/bullet_shift_* wieder an die Grenze) - 700 Byte deckte den
+    // Worst-Fall aller Felder bei Maximalwerten (~592 Byte) mit Marge ab.
+    // Rev (Papiervorschub) kam mit den paper_*-Feldern wieder naeher an die
+    // Grenze (~660 Byte Worst-Fall) - auf 900 Byte angehoben.
+    char line[900];
     int  n = snprintf(line, sizeof(line),
-          "{\"type\":\"config\",\"ssid\":\"%s\",\"pass\":\"%s\","
-          "\"host\":\"%s\",\"port\":%u,\"lane\":%u,"
+          "{\"type\":\"config\",\"mac\":\"%s\",\"lane\":%u,"
           "\"debounce_ms\":%u,\"window_ms\":%u,\"debug\":%d,"
           "\"outlier_um\":%u,\"cluster_radius_um\":%u,\"min_cluster_hits\":%d,"
           "\"max_precision_um\":%u,\"min_mics\":%d,"
           "\"tdoa_us\":%u,\"mic_offset_ns\":[%s],\"mic_enabled\":[%s],\"cal_shots\":%d,"
           "\"target\":\"%s\",\"standoff_steel_mm\":%.2f,\"standoff_paper_mm\":%.2f,"
+          "\"mic_half_x_mm\":%.2f,"
+          "\"bullet_shift_pct\":%d,\"bullet_shift_cap_mm\":%.2f,"
           "\"use_piezo\":%d,\"piezo_min_us\":%u,\"piezo_max_us\":%u,"
           "\"test_cooldown_ms\":%u,\"offset_x_um\":%ld,\"offset_y_um\":%ld,"
           "\"sound_mps\":%u,"
-          "\"static_ip\":%d,\"ip\":\"%s\",\"gateway\":\"%s\","
-          "\"subnet\":\"%s\",\"dns\":\"%s\"}\n",
-          cfg.ssid.c_str(),
-          cfg.pass.length() ? "****" : "",
-          cfg.host.c_str(), cfg.port, cfg.lane,
+          "\"paper_feed_mm\":%.2f,\"paper_speed_mmps\":%.2f,\"paper_auto\":%d,"
+          "\"paper_trigger\":\"%s\",\"paper_dir_invert\":%d,"
+          "\"paper_jog_speed_mmps\":%.2f}\n",
+          deviceMac, cfg.lane,
           cfg.debounceMs, cfg.windowMs, cfg.debug,
           cfg.airOutlierUm, cfg.clusterRadiusUm, cfg.minClusterHits,
           cfg.maxPrecisionUm, cfg.minMics,
           cfg.airMaxTdoaUs, ofsBuf, enBuf, cfg.calShotCount,
           cfg.targetMode == TARGET_PAPER ? "paper" : "steel",
           cfg.standoffSteelMm, cfg.standoffPaperMm,
+          cfg.micHalfXMm,
+          cfg.bulletShiftPct, cfg.bulletShiftCapMm,
           cfg.usePiezo ? 1 : 0, cfg.piezoMinUs, cfg.piezoMaxUs,
           cfg.testCooldownMs, (long)cfg.offsetXUm, (long)cfg.offsetYUm,
           cfg.soundSpeedMps,
-          cfg.staticIP ? 1 : 0, cfg.ip.c_str(), cfg.gateway.c_str(),
-          cfg.subnet.c_str(), cfg.dns.c_str());
+          cfg.paperFeedMm, cfg.paperSpeedMmS, cfg.paperAuto ? 1 : 0,
+          cfg.paperTrigger == PAPER_TRIG_ANY ? "any"
+              : (cfg.paperTrigger == PAPER_TRIG_CLEAN ? "clean" : "piezo"),
+          cfg.paperDirInvert ? 1 : 0,
+          cfg.paperJogSpeedMmS);
     (void)n;
     emitLine(line);
+}
+
+// SHOWNET: Netzwerkbezogene Konfiguration (WLAN, Ziel-Host, eigene IP-
+// Konfiguration) - seit Rev 4.7.1 aus SHOW ausgelagert, da die SHOW-Zeile
+// mit allen Auswertungs-Parametern sonst den Puffer sprengt. wifi_ip/
+// tcp_connected (Rev 4.7.4, vorher Teil von STATUS als wifi/tcp) sind
+// LIVE-Verbindungsstatus, keine Konfiguration - gehoeren aber inhaltlich
+// zur Netzwerkseite und stehen deshalb ebenfalls hier statt in STATUS.
+static void sendShowNetConfig()
+{
+    char wifiIp[20] = "none";
+    if (wifiEnabled && WiFi.status() == WL_CONNECTED) {
+        snprintf(wifiIp, sizeof(wifiIp), "%s", WiFi.localIP().toString().c_str());
+    }
+    // net_pending/net_confirm_deadline_s (Rev 4.9.0, siehe armNetWatchdog
+    // IfNeeded()/serviceNetWatchdog()): net_pending=true, solange eine
+    // Netzwerkaenderung noch nicht per NET CONFIRM bestaetigt wurde -
+    // net_confirm_deadline_s nur vorhanden, wenn der Ruecksprung-Watchdog
+    // bereits laeuft (also NACH dem Reboot mit den neuen Werten; vorher, im
+    // selben Boot-Zyklus wie die SET-Aenderung, gibt es noch keine
+    // Deadline).
+    char netPendBuf[40] = "";
+    if (netPendingLoaded) {
+        if (netWatchdogArmed) {
+            uint32_t remainMs = netWatchdogDeadlineMs - millis();
+            snprintf(netPendBuf, sizeof(netPendBuf),
+                     ",\"net_pending\":true,\"net_confirm_deadline_s\":%u",
+                     (unsigned)(remainMs / 1000));
+        } else {
+            snprintf(netPendBuf, sizeof(netPendBuf), ",\"net_pending\":true");
+        }
+    } else {
+        snprintf(netPendBuf, sizeof(netPendBuf), ",\"net_pending\":false");
+    }
+    char line[500];
+    int  n = snprintf(line, sizeof(line),
+          "{\"type\":\"confignet\",\"mac\":\"%s\",\"ssid\":\"%s\",\"pass\":\"%s\","
+          "\"host\":\"%s\",\"port\":%u,"
+          "\"static_ip\":%d,\"ip\":\"%s\",\"gateway\":\"%s\","
+          "\"subnet\":\"%s\",\"dns\":\"%s\","
+          "\"wifi_ip\":\"%s\",\"tcp_connected\":%s%s}\n",
+          deviceMac,
+          cfg.ssid.c_str(),
+          cfg.pass.length() ? "****" : "",
+          cfg.host.c_str(), cfg.port,
+          cfg.staticIP ? 1 : 0, cfg.ip.c_str(), cfg.gateway.c_str(),
+          cfg.subnet.c_str(), cfg.dns.c_str(),
+          wifiIp, tcp.connected() ? "true" : "false", netPendBuf);
+    (void)n;
+    emitLine(line);
+}
+
+// ---------------------------------------------------------------------------
+// Papiervorschub (NEMA17 + DRV8825/A4988) - siehe PAPER_*-Defines oben
+// ---------------------------------------------------------------------------
+// Nicht-blockierende Schrittmotor-Ansteuerung: servicePaperStepper() wird aus
+// loop() bei jedem Durchlauf aufgerufen und generiert bei Faelligkeit (siehe
+// paperNextStepUs, esp_timer-Zeitbasis wie der Rest der Firmware) jeweils
+// GENAU EINEN STEP-Impuls - ein delay()/eine Warteschleife wuerde sonst
+// waehrend des gesamten Vorschubs (bis zu mehrere Sekunden) Schusserfassung,
+// Netzwerk und Kommandoverarbeitung blockieren.
+//
+// PAPER_IDLE:                kein Vorschub aktiv, Treiber stromlos (EN=HIGH)
+// PAPER_FEEDING:              automatischer Vorschub nach einem Schuss
+//                             (SET PAPERFEED-Strecke, Geschwindigkeitsprofil
+//                             siehe unten), Treiber aktiv
+// PAPER_JOG_FWD/PAPER_JOG_REV: manueller Dauerbetrieb ueber die beiden
+//                             Kippschalter-Positionen (Einfaedeln), feste
+//                             SET PAPERJOGSPEED (Default 75.0mm/s), Treiber aktiv
+enum PaperMode : uint8_t { PAPER_IDLE, PAPER_FEEDING, PAPER_JOG_FWD, PAPER_JOG_REV };
+static PaperMode paperMode       = PAPER_IDLE;
+static uint32_t  paperStepIndex  = 0;   // bereits ausgefuehrte Schritte (PAPER_FEEDING)
+static uint32_t  paperStepsTotal = 0;   // Gesamtschritte fuer den laufenden Vorschub
+static uint32_t  paperHalfSteps  = 0;   // Schrittindex, ab dem abgebremst wird
+static uint64_t  paperNextStepUs = 0;   // esp_timer_get_time()-Zeitpunkt des naechsten Schritts
+static bool      paperStepPinHigh = false; // STEP aktuell HIGH, wartet auf Ruecklanke
+static uint64_t  paperStepFallUs  = 0;     // Zeitpunkt, zu dem STEP wieder LOW gezogen wird
+
+static inline uint32_t paperStepPeriodUsForSpeed(float mmPerS)
+{
+    if (mmPerS < 0.05f) mmPerS = 0.05f;   // Division durch 0 / absurd lange Perioden vermeiden
+    return (uint32_t)(1.0e6f / (mmPerS * PAPER_STEPS_PER_MM));
+}
+
+// SET TESTMODE=1 (siehe testMode weiter oben): gibt bei jeder Aenderung von
+// EN/DIR eine Klartext-Zeile aus (Verkabelungs-/Elektronik-Fehlersuche fuer
+// den Papiervorschub) - analog zu den bestehenden Sensor-Testmodus-Zeilen,
+// aber unabhaengig davon ueber emitLine() ausgegeben, da EN/DIR nur bei
+// einem Moduswechsel (nicht bei jedem Schritt) gesetzt werden.
+static void paperTestLog(const char *msg)
+{
+    if (!testMode) return;
+    emitLine(msg);
+}
+
+static inline void paperEnable(bool en)
+{
+    bool level = en ? LOW : HIGH;
+    if (testMode) {
+        char buf[64];
+        snprintf(buf, sizeof(buf), "PAPER EN(GPIO%d) = %s", PAPER_EN_PIN,
+                 en ? "LOW (aktiv)" : "HIGH (aus)");
+        paperTestLog(buf);
+    }
+    digitalWrite(PAPER_EN_PIN, level);   // aktiv-LOW (DRV8825/A4988-Standard)
+}
+
+static inline void paperSetDir(bool forward)
+{
+    bool level = forward != cfg.paperDirInvert;    // SET PAPERDIR invertiert bei Bedarf
+    if (testMode) {
+        char buf[80];
+        snprintf(buf, sizeof(buf), "PAPER DIR(GPIO%d) = %s (%s%s)", PAPER_DIR_PIN,
+                 level ? "HIGH" : "LOW", forward ? "vorwaerts" : "rueckwaerts",
+                 cfg.paperDirInvert ? ", PAPERDIR=1 invertiert" : "");
+        paperTestLog(buf);
+    }
+    digitalWrite(PAPER_DIR_PIN, level ? HIGH : LOW);
+}
+
+// Zaehler fuer die STEP-Impulse im Testmodus - bei jedem einzelnen Schritt
+// zu loggen wuerde die Ausgabe fluten (bis zu ~400 Schritte je Vorschub),
+// daher nur alle 100 Impulse eine Meldung.
+static uint32_t paperTestStepCount = 0;
+
+// Zieht STEP JETZT auf HIGH und merkt sich (paperStepFallUs), wann
+// servicePaperStepper() es wieder LOW ziehen soll - die HALBE uebergebene
+// Periode (periodUs), siehe Kommentar bei PAPER_STEP_PULSE_MIN_US. Bewusst
+// KEIN delayMicroseconds() fuer die Ruecklanke mehr: bei niedrigen
+// Geschwindigkeiten waere die halbe Periode viele zehn/hundert Millisekunden
+// lang - das wuerde Schusserfassung/Netzwerk/Kommandoverarbeitung so lange
+// blockieren. Die eigentliche Ruecklanke erledigt der Aufruf am Anfang von
+// servicePaperStepper() bei jedem loop()-Durchlauf.
+static inline void paperStepRise(uint32_t periodUs)
+{
+    digitalWrite(PAPER_STEP_PIN, HIGH);
+    uint32_t highUs = periodUs / 2;
+    if (highUs < PAPER_STEP_PULSE_MIN_US) highUs = PAPER_STEP_PULSE_MIN_US;
+    paperStepFallUs  = (uint64_t)esp_timer_get_time() + highUs;
+    paperStepPinHigh = true;
+    if (testMode) {
+        paperTestStepCount++;
+        if (paperTestStepCount % 100 == 0) {
+            char buf[48];
+            snprintf(buf, sizeof(buf), "PAPER STEP(GPIO%d) Impuls #%u",
+                     PAPER_STEP_PIN, (unsigned)paperTestStepCount);
+            paperTestLog(buf);
+        }
+    }
+}
+
+// Startet den automatischen Vorschub (SET PAPERFEED mm, siehe processShot())
+// - wird ignoriert, wenn bereits ein Vorschub laeuft oder gerade manuell per
+// Schalter eingefaedelt wird (kein Ueberlagern zweier Bewegungen).
+static void startPaperFeed()
+{
+    if (paperMode != PAPER_IDLE) return;
+    uint32_t steps = (uint32_t)lroundf(cfg.paperFeedMm * PAPER_STEPS_PER_MM);
+    if (steps == 0) return;
+    paperStepsTotal = steps;
+    paperHalfSteps  = steps / 2;
+    paperStepIndex  = 0;
+    paperSetDir(true);
+    paperEnable(true);
+    paperMode       = PAPER_FEEDING;
+    paperNextStepUs = (uint64_t)esp_timer_get_time();
+}
+
+// Aus loop() bei jedem Durchlauf aufzurufen. Prueft zuerst die beiden
+// Einfaedel-Schalter (haben Vorrang, unterbrechen dafuer noetigenfalls auch
+// einen laufenden automatischen Vorschub) und bedient danach - falls faellig
+// - den naechsten Schritt des aktuellen Modus.
+static void servicePaperStepper()
+{
+    // Ruecklanke eines evtl. noch offenen STEP-Impulses zuerst bedienen -
+    // unabhaengig von paperMode/Schaltern, damit ein Impuls auch dann
+    // korrekt zu Ende gebracht wird, wenn sich der Modus zwischenzeitlich
+    // aendert (z.B. Vorschub fertig, Schalter losgelassen).
+    if (paperStepPinHigh && (uint64_t)esp_timer_get_time() >= paperStepFallUs) {
+        digitalWrite(PAPER_STEP_PIN, LOW);
+        paperStepPinHigh = false;
+    }
+
+    bool swFwd = (digitalRead(PAPER_SW_FWD_PIN) == LOW);
+    bool swRev = (digitalRead(PAPER_SW_REV_PIN) == LOW);
+
+    // SET TESTMODE=1: bei jeder Pegelaenderung (nicht bei jedem loop()-
+    // Durchlauf) eine Klartext-Zeile - zeigt direkt, ob die Verkabelung der
+    // Schalter (aktiv=LOW gegen GND, siehe INPUT_PULLUP in setup()) korrekt
+    // ankommt, unabhaengig davon, ob daraus ein Modus-/Bewegungswechsel folgt.
+    if (testMode) {
+        static bool lastSwFwd = false, lastSwRev = false;
+        char buf[48];
+        if (swFwd != lastSwFwd) {
+            snprintf(buf, sizeof(buf), "PAPER GPIO%d (vorwaerts) %s",
+                     PAPER_SW_FWD_PIN, swFwd ? "erkannt" : "losgelassen");
+            paperTestLog(buf);
+            lastSwFwd = swFwd;
+        }
+        if (swRev != lastSwRev) {
+            snprintf(buf, sizeof(buf), "PAPER GPIO%d (rueckwaerts) %s",
+                     PAPER_SW_REV_PIN, swRev ? "erkannt" : "losgelassen");
+            paperTestLog(buf);
+            lastSwRev = swRev;
+        }
+    }
+
+    if (swFwd && !swRev) {
+        if (paperMode != PAPER_JOG_FWD) {
+            paperMode       = PAPER_JOG_FWD;
+            paperSetDir(true);
+            paperEnable(true);
+            paperNextStepUs = (uint64_t)esp_timer_get_time();
+        }
+    } else if (swRev && !swFwd) {
+        if (paperMode != PAPER_JOG_REV) {
+            paperMode       = PAPER_JOG_REV;
+            paperSetDir(false);
+            paperEnable(true);
+            paperNextStepUs = (uint64_t)esp_timer_get_time();
+        }
+    } else if (paperMode == PAPER_JOG_FWD || paperMode == PAPER_JOG_REV) {
+        // Weder noch (Normalfall bei losgelassenem Schalter) ODER beide
+        // Pins gleichzeitig (sollte am 2-Positionen-Kippschalter nicht
+        // vorkommen) - in beiden Faellen sicherheitshalber stoppen statt
+        // eine Richtung zu vermuten.
+        paperMode = PAPER_IDLE;
+        paperEnable(false);
+    }
+
+    if (paperMode == PAPER_IDLE) return;
+
+    uint64_t now = (uint64_t)esp_timer_get_time();
+    if (now < paperNextStepUs) return;
+
+    if (paperMode == PAPER_JOG_FWD || paperMode == PAPER_JOG_REV) {
+        uint32_t period = paperStepPeriodUsForSpeed(cfg.paperJogSpeedMmS);
+        paperStepRise(period);
+        paperNextStepUs = now + period;
+        return;
+    }
+
+    // PAPER_FEEDING: erste Haelfte der Strecke mit konstanter SET PAPERSPEED,
+    // zweite Haelfte linear abfallend bis PAPER_DECEL_END_FRACTION davon
+    // (mind. PAPER_MIN_SPEED_MMPS) - bremst die Papierrolle rechtzeitig ab,
+    // damit sie durch ihre eigene Massentraegheit am Ende nicht nachlaeuft.
+    float speed = cfg.paperSpeedMmS;
+    if (paperStepIndex >= paperHalfSteps && paperStepsTotal > paperHalfSteps) {
+        float frac = (float)(paperStepIndex - paperHalfSteps)
+                   / (float)(paperStepsTotal - paperHalfSteps);
+        float endSpeed = cfg.paperSpeedMmS * PAPER_DECEL_END_FRACTION;
+        if (endSpeed < PAPER_MIN_SPEED_MMPS) endSpeed = PAPER_MIN_SPEED_MMPS;
+        speed = cfg.paperSpeedMmS - frac * (cfg.paperSpeedMmS - endSpeed);
+    }
+    uint32_t period = paperStepPeriodUsForSpeed(speed);
+    paperStepRise(period);
+    paperStepIndex++;
+    if (paperStepIndex >= paperStepsTotal) {
+        paperMode = PAPER_IDLE;
+        paperEnable(false);
+        return;
+    }
+    paperNextStepUs = now + period;
 }
 
 // ---------------------------------------------------------------------------
@@ -872,15 +1801,19 @@ static void sendShowConfig()
 // Platte weg Richtung Schuetze. Mic-Reihenfolge identisch zu AIR_PINS[]:
 //   0 = GPIO25 = links unten     1 = GPIO26 = rechts unten
 //   2 = GPIO27 = links oben      3 = GPIO14 = rechts oben
-//   4 = GPIO35 = links mitte(!)  5 = GPIO33 = rechts mitte
-// (!) TEMPORAER verlegt fuer Diagnose-Test 3: GPIO32->GPIO35 (dasselbe
-// Signal, anderer ESP32-Pin - siehe Kommentar bei AIR_PINS[] weiter oben).
-// GPIO25<->GPIO33-Tausch aus Test 2 und der Mikrofon-Tausch aus Test 1 sind
-// beide wieder zurueckgebaut/normal.
+//   4 = GPIO32 = links mitte     5 = GPIO33 = rechts mitte
+// Diagnose-Test 3 (GPIO32->GPIO35) ist zurueckgebaut, die Tests 1
+// (Mikrofon-Tausch GPIO27/32) und 2 (GPIO25<->GPIO33-Tausch) waren bereits
+// vorher zurueckgebaut - alle drei Hardware-Diagnosetests sind damit
+// abgeschlossen/normal.
 
 // x-Abstand Mic-Spalte<->vertikale Mittellinie ist bei beiden Zielarten
-// (Stahl/Papier) baugleich, daher ein fester Wert fuer beide Modi.
-#define MIC_HALF_X          115.0f  // mm, horizontaler Abstand Mic-Spalte<->Zentrum
+// (Stahl/Papier) baugleich, daher ein fester Wert fuer beide Modi. Seit Rev
+// 4.7.3 nur noch der Default-Wert - der tatsaechlich genutzte Abstand ist
+// per SET MICHALFX laufzeitkonfigurierbar (cfg.micHalfXMm), siehe
+// applyMicHalfX() weiter unten (deckt z.B. ab, dass die Mikrofon-Membran
+// 1-2mm hinter der aeusseren, bisher vermessenen Huelle liegt).
+#define MIC_HALF_X          115.0f  // mm, horizontaler Abstand Mic-Spalte<->Zentrum (Default)
 // Stahlblech (Abprallflaeche, Rev <= 4.x Default): Mics 100mm ueber/unter
 // Mitte, 30mm rechtwinklig vor der Platte.
 #define MIC_HALF_Y_STEEL    100.0f  // mm
@@ -918,26 +1851,39 @@ static void applySoundSpeed()
 // Kabellaengen-/Bauteil-Unterschiede ggf. zu eng bemessen war.
 #define MIC_OFS_MAX_NS  20000
 
-// MIC_Y/micStandoffMm sind laufzeitveraenderlich (SET TARGET=STEEL|PAPER,
-// siehe applyTargetGeometry() unten) - MIC_X bleibt fuer beide Modi gleich.
+// MIC_X/MIC_Y/micStandoffMm sind laufzeitveraenderlich (SET MICHALFX bzw.
+// SET TARGET=STEEL|PAPER, siehe applyMicHalfX()/applyTargetGeometry()
+// unten) - MIC_X bleibt fuer beide Zielarten gleich, wird aber (anders als
+// frueher) nicht mehr vom Zielmodus, sondern nur noch von SET MICHALFX
+// bestimmt.
 //
-// Diagnose-Test 2 (GPIO25<->GPIO33-Tausch am LM339-Ausgang) ist zurueckgebaut
-// - MIC_X wieder auf Normalstand. Diagnose-Test 3 (GPIO32->GPIO35, dasselbe
-// Signal wie bisher nur auf anderem Pin) bleibt aktiv, betrifft aber nur
-// AIR_PINS[4] (siehe dortigen Kommentar) - die Geometrie (MIC_X/MIC_Y) war
-// davon nie betroffen, da sich am Signal selbst nichts aendert.
-static const float MIC_X[NUM_AIR] = { -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X };
+// Alle 3 Hardware-Diagnosetests (Mikrofon-Tausch GPIO27/32, LM339-Ausgang-
+// Tausch GPIO25/33, GPIO32->GPIO35) sind zurueckgebaut - MIC_X wieder auf
+// Normalstand. Test 3 betraf ohnehin nur AIR_PINS[4] (siehe dortigen
+// Kommentar), nie die Geometrie hier (dasselbe Signal, nur anderer Pin).
+static float MIC_X[NUM_AIR] = { -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X };
 static float MIC_Y[NUM_AIR] = { -MIC_HALF_Y_STEEL, -MIC_HALF_Y_STEEL, +MIC_HALF_Y_STEEL, +MIC_HALF_Y_STEEL, 0.0f, 0.0f };
 static float micStandoffMm = MIC_STANDOFF_STEEL;
+
+// Setzt MIC_X[] passend zum per SET MICHALFX gewaehlten horizontalen
+// Mic-Abstand zur Mittellinie. Wird beim Booten (nach loadConfig()) und bei
+// jeder Aenderung von SET MICHALFX aufgerufen - wirkt sofort, kein Reboot
+// noetig. Getrennt von applyTargetGeometry(), da der X-Abstand (anders als
+// Y-Abstand/Standoff) nicht vom Zielmodus abhaengt.
+static void applyMicHalfX()
+{
+    MIC_X[0] = -cfg.micHalfXMm; MIC_X[1] = +cfg.micHalfXMm;
+    MIC_X[2] = -cfg.micHalfXMm; MIC_X[3] = +cfg.micHalfXMm;
+    MIC_X[4] = -cfg.micHalfXMm; MIC_X[5] = +cfg.micHalfXMm;
+}
 
 // Setzt MIC_Y[]/micStandoffMm passend zum per SET TARGET gewaehlten
 // Messmodus. Wird beim Booten (nach loadConfig()) und bei jeder Aenderung
 // von SET TARGET aufgerufen - wirkt sofort, kein Reboot noetig.
 //
-// Diagnose-Tests 1 (AIR2<->AIR4-Mikrofontausch) und 2 (GPIO25<->GPIO33-
-// Tausch am LM339-Ausgang) sind beide zurueckgebaut - MIC_Y wieder auf
-// Normalstand. Diagnose-Test 3 (GPIO32->GPIO35) betrifft nur AIR_PINS[4]
-// (siehe dortigen Kommentar), nicht die Geometrie hier.
+// Alle 3 Diagnose-Tests (AIR2<->AIR4-Mikrofontausch, GPIO25<->GPIO33-Tausch
+// am LM339-Ausgang, GPIO32->GPIO35) sind zurueckgebaut - MIC_Y wieder auf
+// Normalstand.
 static void applyTargetGeometry()
 {
     const float halfY = (cfg.targetMode == TARGET_PAPER) ? MIC_HALF_Y_PAPER : MIC_HALF_Y_STEEL;
@@ -1043,7 +1989,8 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
 
     bool  found = false;
     int   bestCandIdx = -1;
-    float bestResidual = -1.0f, bestX = 0.0f, bestY = 0.0f;
+    float bestResidual = -1.0f, bestX = 0.0f, bestY = 0.0f, bestD = 0.0f;
+    int   bestRef = -1, bestA = -1, bestB = -1;
     for (int i0 = 0; i0 < nAll; i0++) {
     for (int i1 = i0 + 1; i1 < nAll; i1++) {
     for (int i2 = i1 + 1; i2 < nAll; i2++) {
@@ -1094,10 +2041,47 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
             bestResidual = residual;
             bestX = x;
             bestY = y;
+            bestD = d;
+            bestRef = ref;
+            bestA = a;
+            bestB = b;
             bestCandIdx = candIdx;
         }
     }}}
     if (!found) return false;
+
+    // Kugeldurchmesser-Korrektur (SET BSHIFTPCT/BSHIFTCAP): das Projektil
+    // (ca. 4,5mm Durchmesser) strahlt den Einschlagsschall nicht exakt aus
+    // dem Lochmittelpunkt ab, sondern eher von der dem jeweiligen Mikrofon
+    // zugewandten Kugeloberflaeche. Fuer die an der Stufe-1-Loesung NICHT
+    // beteiligten (verbleibenden) Mikrofone zeigt genau das der signierte
+    // Rest-Fehler an: dc-(bestD+rc) > 0 heisst, das Mikrofon hat den Schall
+    // FRUEHER empfangen als es die Punktquelle bestX/bestY vorhersagt -> die
+    // tatsaechliche Quelle lag naeher an diesem Mikrofon. bestX/bestY wird
+    // deshalb je verbleibendem Mikrofon in dessen Richtung verschoben,
+    // gewichtet mit SET BSHIFTPCT (Default 50%) und je Mikrofon gedeckelt
+    // auf SET BSHIFTCAP (Default 3.0mm) - bewusst NUR auf die Stufe-1-
+    // Loesung angewendet (wirkt dadurch automatisch auch als neue Referenz
+    // fuer den Verifizierungsschritt/Stufe 2 unten), 0% schaltet ab.
+    if (cfg.bulletShiftPct > 0) {
+        float shiftX = 0.0f, shiftY = 0.0f;
+        for (int k = 0; k < nAll; k++) {
+            const int m = all[k];
+            if (m == bestRef || m == bestA || m == bestB) continue;
+            const float mdx = MIC_X[m] - bestX, mdy = MIC_Y[m] - bestY;
+            const float distM = sqrtf(mdx*mdx + mdy*mdy);
+            if (distM < 1.0e-3f) continue;
+            const float dc = sqrtf(mdx*mdx + mdy*mdy + micStandoffMm*micStandoffMm);
+            const float rc = (float)(tNs[m] - tNs[bestRef]) * soundMmPerNs;
+            const float signedResidual = dc - (bestD + rc);
+            float shift = signedResidual * ((float)cfg.bulletShiftPct / 100.0f);
+            shift = constrain(shift, -cfg.bulletShiftCapMm, cfg.bulletShiftCapMm);
+            shiftX += shift * (mdx / distM);
+            shiftY += shift * (mdy / distM);
+        }
+        bestX += shiftX;
+        bestY += shiftY;
+    }
 
     // Praezision: quadratisch gemittelte Abweichung (RMS) der bis zu 2
     // NAECHSTGELEGENEN zusaetzlichen Kandidatenpositionen (aus den uebrigen
@@ -1246,9 +2230,15 @@ static void runCalibration()
     // Startschrittweite/Rundenzahl bewusst so gewaehlt, dass die Summe aller
     // Schritte (geometrische Reihe, Faktor 0.5) den vollen erlaubten Bereich
     // (+-MIC_OFS_MAX_NS=20000, siehe Kommentar dort) tatsaechlich erreichen
-    // kann: 10000*(2-2^-8) ~ 19961ns, letzter Schritt ~39ns.
+    // kann: 10000*(2-2^-10) ~ 19990ns, letzter Schritt ~9.8ns. 2 zusaetzliche
+    // Runden (Rev 4.7.2, vorher 9) gegen das Nachbau-Ergebnis von Session
+    // 2026-08-25: bei nur 5 Kalibrier-Schuessen kann ein Mic-Offset ueber
+    // mehrere Runden hinweg exakt auf einem groben Zwischenschritt "einfrieren"
+    // (Kostenfunktion an der Stelle zu flach fuer die dortige Schrittweite),
+    // bevor er sich doch noch loest - die 2 zusaetzlichen, noch feineren
+    // Runden geben einem solchen Wert eine bessere Chance, sich zu loesen.
     float       stepNs  = 10000.0f;
-    for (int pass = 0; pass < 9; pass++) {
+    for (int pass = 0; pass < 11; pass++) {
         for (int i = 0; i < NUM_AIR; i++) {
             if (i == refMic) continue;
             const float base     = offsets[i];
@@ -1271,9 +2261,10 @@ static void runCalibration()
         stepNs *= 0.5f;
     }
 
-    char line[256];
+    char line[300];
     int  n = snprintf(line, sizeof(line),
-                      "{\"type\":\"cal\",\"state\":\"done\",\"offsets_ns\":[");
+                      "{\"type\":\"cal\",\"state\":\"done\",\"mac\":\"%s\",\"offsets_ns\":[",
+                      deviceMac);
     for (int i = 0; i < NUM_AIR; i++) {
         cfg.micOffsetNs[i] = (int32_t)lroundf(offsets[i]);
         char key[8];
@@ -1290,6 +2281,13 @@ static void runCalibration()
 
 static void processShot()
 {
+    // TESTSHOOT (siehe handleTestShoot()): gilt NUR fuer GENAU diese eine
+    // Auswertung, deshalb sofort lesen und zuruecksetzen - ein spaeterer
+    // echter Treffer darf nicht faelschlich als "synthetic" markiert werden.
+    const bool wasSynthetic = syntheticShotPending;
+    syntheticShotPending = false;
+    const char *synSuffix = wasSynthetic ? ",\"synthetic\":1" : "";
+
     uint32_t localAirCC[NUM_AIR][AIR_MAX_EDGES];
     uint8_t  localAirN[NUM_AIR];
     uint32_t localFirstAirCC;
@@ -1405,6 +2403,18 @@ static void processShot()
     shotCounter++;
     sequenceNo++;
 
+    // Automatischer Papiervorschub (SET PAPERAUTO/PAPERTRIGGER, siehe
+    // servicePaperStepper() weiter oben): ANY/PIEZO werden hier bewusst VOR
+    // dem airHits-Reject-Check ausgeloest, da beide Modi unabhaengig davon
+    // gelten sollen, ob genug Mikrofone fuer eine Positionsloesung reichten
+    // (das Piezo erkennt den Einschlag unabhaengig von den Luft-Mics). Der
+    // CLEAN-Modus wird erst ganz unten nach der isClean-Berechnung ausgeloest.
+    if (cfg.paperAuto
+        && (cfg.paperTrigger == PAPER_TRIG_ANY
+            || (cfg.paperTrigger == PAPER_TRIG_PIEZO && localPiezoSeen))) {
+        startPaperFeed();
+    }
+
     if (airHits < cfg.minMics) {
         // Rev 4.6.1: nicht mehr an SET DEBUG gebunden - geht jetzt immer
         // raus, damit bei der Anzeige zu jeder Sequenz-Nummer etwas ankommt
@@ -1413,14 +2423,14 @@ static void processShot()
         // felder (SET DEBUG=3), nicht mehr OB ueberhaupt etwas gesendet wird.
         if (cfg.usePiezo && localPiezoSeen) {
             emitf("{\"type\":\"reject\",\"seq\":%u,\"reason\":\"only %d mic(s)\","
-                  "\"hits\":%d,\"piezo_ns\":%lld}\n",
-                  sequenceNo, airHits, airHits, (long long)piezoT0NsRaw);
+                  "\"hits\":%d,\"piezo_ns\":%lld%s}\n",
+                  sequenceNo, airHits, airHits, (long long)piezoT0NsRaw, synSuffix);
         } else if (cfg.usePiezo) {
             emitf("{\"type\":\"reject\",\"seq\":%u,\"reason\":\"only %d mic(s)\","
-                  "\"hits\":%d,\"piezo_ns\":null}\n", sequenceNo, airHits, airHits);
+                  "\"hits\":%d,\"piezo_ns\":null%s}\n", sequenceNo, airHits, airHits, synSuffix);
         } else {
             emitf("{\"type\":\"reject\",\"seq\":%u,\"reason\":\"only %d mic(s)\","
-                  "\"hits\":%d}\n", sequenceNo, airHits, airHits);
+                  "\"hits\":%d%s}\n", sequenceNo, airHits, airHits, synSuffix);
         }
         return;
     }
@@ -1516,9 +2526,14 @@ static void processShot()
                  && clusterN >= (int)cfg.minClusterHits
                  && (unsigned long)precUm <= cfg.maxPrecisionUm
                  && (!cfg.usePiezo || piezoOk);
+    // SET PAPERTRIGGER=CLEAN: erst jetzt ausloesen, da isClean erst hier
+    // feststeht (ANY/PIEZO werden weiter oben vor dem Reject-Check ausgeloest)
+    if (cfg.paperAuto && cfg.paperTrigger == PAPER_TRIG_CLEAN && isClean) {
+        startPaperFeed();
+    }
     n += snprintf(line + n, sizeof(line) - n, ",\"clean\":%d", isClean ? 1 : 0);
-    snprintf(line + n, sizeof(line) - n, ",\"hits\":%d,\"ts\":%llu}\n",
-             airHits, (unsigned long long)(localFirstUs / 1000ULL));
+    snprintf(line + n, sizeof(line) - n, ",\"hits\":%d,\"ts\":%llu%s}\n",
+             airHits, (unsigned long long)(localFirstUs / 1000ULL), synSuffix);
 
     // Rev 4.6.1: nicht mehr an isClean/SET DEBUG gebunden - geht jetzt IMMER
     // raus (auch unsaubere/Ausreisser-Schuesse), damit bei der Anzeige zu
@@ -1566,6 +2581,15 @@ static void sendHelp()
         "#   SET STANDOFFSTEEL=<5.0-100.0>  Mic-Standoff (rechtwinklig zur Platte)",
         "#                            in mm, STEEL-Modus (Default 30.0)",
         "#   SET STANDOFFPAPER=<5.0-100.0>  Wie STANDOFFSTEEL, PAPER-Modus (Default 28.0)",
+        "#   SET MICHALFX=<5.0-300.0> Horizontaler Mic-Abstand zur Mittellinie in mm,",
+        "#                            fuer STEEL UND PAPER gleich (Default 115.0)",
+        "#   SET BSHIFTPCT=<0-100>    Kugeldurchmesser-Korrektur (siehe solveAirPosition()):",
+        "#                            Gewichtung in % des Rest-Fehlers der Stufe-1-Loesung",
+        "#                            gegen die daran unbeteiligten Mikrofone, als Ver-",
+        "#                            schiebung Richtung/weg vom jeweiligen Mikrofon",
+        "#                            (Default 50, 0=Korrektur aus)",
+        "#   SET BSHIFTCAP=<0.0-20.0> Kappung der Kugeldurchmesser-Korrektur je Mikrofon",
+        "#                            in mm (Default 3.0)",
         "#   SET PIEZO=<0|1>          Piezo (Stahlplatte, GPIO34) als Trigger-",
         "#                            Bestaetigung nutzen (Default 1/an)",
         "#   SET PIEZOMIN=<0-5000>    Min. erwartete Piezo-Verzoegerung in us",
@@ -1593,6 +2617,28 @@ static void sendHelp()
         "#                            wachsender Fehler (Rand zu nah am Zentrum)",
         "#                            -> Wert erhoehen. Rein manueller Wert, wird",
         "#                            NICHT von CAL START mitkalibriert.",
+        "#   SET PAPERFEED=<10.0-100.0>     Papiervorschub je Schuss in mm (Default 50.0)",
+        "#   SET PAPERSPEED=<0.5-30.0> Vorschub-Geschwindigkeit in mm/s fuer die erste",
+        "#                            Haelfte der Strecke, danach Abbremsrampe (Default 5.0)",
+        "#   SET PAPERAUTO=<0|1>      Automatischen Vorschub durchfuehren (Default 1/an)",
+        "#   SET PAPERTRIGGER=<ANY|PIEZO|CLEAN>  Wann automatisch vorgeschoben wird:",
+        "#                            ANY=jede Ausloesung, PIEZO=nur wenn das Piezo",
+        "#                            ausgeloest hat (Default), CLEAN=nur bei \"clean\"-Schuss",
+        "#   SET PAPERDIR=<0|1>       Vorschub-Drehrichtung invertieren (Default 1),",
+        "#                            gleicht vertauschte Motoranschluesse softwareseitig aus",
+        "#   SET PAPERJOGSPEED=<1.0-100.0>  Geschwindigkeit fuer den manuellen Dauer-",
+        "#                            betrieb (Einfaedeln, Kippschalter) in mm/s (Default 75.0)",
+        "#   TESTSHOOTPAPER            Loest den Papiervorschub aus, so als waere ein",
+        "#                            Schuss registriert worden (kein echtes Schuss-Telegramm,",
+        "#                            zaehlt nicht in shots/seq) - zum Testen von Mechanik/",
+        "#                            Treiber ohne Schuss auf die Scheibe",
+        "#   TESTSHOOT [<z_mm>]        Synthetischer Testschuss zum Pruefen der Kommunikation:",
+        "#                            waehlt x/y zufaellig in [-z_mm, +z_mm] (Default 25.0 =",
+        "#                            gesamte LG-Scheibe), erzeugt dazu passende Rohlaufzeiten",
+        "#                            nach AKTUELLER Kalibrierung und laesst ein normales",
+        "#                            shot/reject-Telegramm entstehen (inkl. Papiervorschub,",
+        "#                            \"synthetic\":1 markiert es als Testschuss). Fehler bei",
+        "#                            laufendem Schuss/Sperrzeit/aktiver CAL START-Sammlung.",
         "#   SET CALSHOTS=<3-20>      Anzahl Kalibrier-Schuesse fuer CAL START (Default 5)",
         "#   SET OFS0..OFS5=<-20000..20000>  Timing-Offset je Mikrofon in ns (Default 0,",
         "#                            wird durch CAL START automatisch gesetzt)",
@@ -1614,7 +2660,48 @@ static void sendHelp()
         "#   CAL STATUS               zeigt Kalibrier-Fortschritt",
         "#   CAL RESET                setzt alle Mikrofon-Offsets auf 0 und die",
         "#                            Schallgeschwindigkeit auf 355 m/s zurueck",
-        "# Weitere Befehle: SHOW  STATUS  PING  RESET  REBOOT  FACTORY  HELP/?",
+        "#   CAL IMPORT OFS0=<ns>,...,OFS5=<ns>,SOUNDSPEED=<mps>  atomarer Bulk-",
+        "#                            Restore (z.B. vom Stand-PC gespeicherte Kalibrierung) -",
+        "#                            erst alle Werte validieren, dann erst schreiben",
+        "# Weitere Befehle: SHOW  SHOWNET  STATUS  PING  RESET  REBOOT  FACTORY  HELP/?",
+        "#   SHOWNET zeigt die Netzwerkkonfiguration (SSID/Pass/Host/Port/eigene",
+        "#   IP-Konfiguration) UND den Live-Verbindungsstatus (wifi_ip/tcp_connected)",
+        "#   separat von SHOW (Auswertungs-Parameter) und STATUS (Betriebsstatus)",
+        "# Korrelations-ID: jeder Befehl kann mit \" #<id>\" enden (z.B. SET LANE=2 #7)",
+        "# - die Antwort(en) auf GENAU diesen Befehl tragen dann zusaetzlich \"corr\":<id>",
+        "# ACTION-Namensraum (kurzlebige Bedienbefehle, NICHT persistent):",
+        "#   ACTION LIGHT=ON|OFF       uebersteuert die automatische Standbeleuchtung",
+        "#   ACTION LIGHT=AUTO         gibt die Beleuchtung zurueck an serviceLight()",
+        "#   ACTION TARGETCHANGE       loest einen Papiervorschub aus (wie TESTSHOOTPAPER,",
+        "#                            gleicher Codepfad, sprechenderer Name fuer den",
+        "#                            produktiven Scheibenwechsel-Bedienfall)",
+        "# NET-Befehle (Sicherheitsnetz fuer Netzwerk-Fernkonfiguration):",
+        "#   NET STATUS               zeigt, ob eine Netzwerkaenderung auf Bestaetigung",
+        "#                            wartet (und ggf. verbleibende Zeit bis zum",
+        "#                            automatischen Ruecksprung)",
+        "#   NET CONFIRM              bestaetigt eine gerade aktive Netzwerkkonfiguration",
+        "#                            endgueltig - erst NACH dem Reboot moeglich, der sie",
+        "#                            uebernommen hat (siehe SET SSID/PASS/HOST/PORT/",
+        "#                            STATIC/IP/GW/SUBNET/DNS: die erste solche Aenderung",
+        "#                            je Bootzyklus sichert automatisch einen Ruecksprung-",
+        "#                            punkt; wird binnen 3 Minuten nach dem naechsten Boot",
+        "#                            kein NET CONFIRM gesendet, stellt der ESP32 die",
+        "#                            zuletzt bestaetigte Konfiguration automatisch wieder",
+        "#                            her und startet neu)",
+        "# PIN-Diagnose (manuelles Setzen/Lesen einzelner GPIOs, NICHT persistent,",
+        "# nach Reboot wieder im normalen Betriebszustand):",
+        "#   PIN <n> IN               Pin als Eingang ohne Pull-Widerstand, liest sofort",
+        "#   PIN <n> PULLUP           Pin als Eingang mit internem Pull-Up, liest sofort",
+        "#   PIN <n> PULLDOWN         Pin als Eingang mit internem Pull-Down, liest sofort",
+        "#   PIN <n> OUT=<0|1>        Pin als Ausgang, auf LOW/HIGH setzen",
+        "#   PIN <n> READ             aktuellen Pegel im zuletzt gesetzten Modus lesen",
+        "#                            (Fehler, falls fuer <n> noch kein Modus gesetzt wurde)",
+        "#   PIN LIST                 IN/PULLUP/PULLDOWN/OUT-Status + Pegel aller",
+        "#                            erlaubten Pins auf einen Blick",
+        "#   Erlaubte Pins (Positivliste): 0, 2, 4, 15, 16, 17, 18, 19, 21 - davon sind",
+        "#   16/17/18/19/21 im Normalbetrieb der Papiervorschub (STEP/DIR/EN/Schalter),",
+        "#   ein PIN-Kommando ueberschreibt deren Modus/Pegel bis zum naechsten",
+        "#   Schritt-Impuls bzw. zur naechsten Schalter-Abfrage",
     };
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
         Serial.println(lines[i]);
@@ -1633,17 +2720,21 @@ static bool handleSet(const String &raw)
     val.trim();
 
     if (key == "SSID") {
+        armNetWatchdogIfNeeded();
         cfg.ssid = val; saveVal<String>("ssid", val);
         emitf("{\"type\":\"ok\",\"set\":\"ssid\",\"reboot_required\":true}\n");
     } else if (key == "PASS") {
+        armNetWatchdogIfNeeded();
         cfg.pass = val; saveVal<String>("pass", val);
         emitf("{\"type\":\"ok\",\"set\":\"pass\",\"reboot_required\":true}\n");
     } else if (key == "HOST") {
+        armNetWatchdogIfNeeded();
         cfg.host = val; saveVal<String>("host", val);
         emitf("{\"type\":\"ok\",\"set\":\"host\",\"reboot_required\":true}\n");
     } else if (key == "PORT") {
         long p = val.toInt();
         if (p < 1 || p > 65535) { emitLine("{\"type\":\"error\",\"msg\":\"port 1-65535\"}\n"); return true; }
+        armNetWatchdogIfNeeded();
         cfg.port = (uint16_t)p; saveVal<uint16_t>("port", cfg.port);
         emitf("{\"type\":\"ok\",\"set\":\"port\",\"reboot_required\":true}\n");
     } else if (key == "LANE") {
@@ -1723,6 +2814,25 @@ static bool handleSet(const String &raw)
         saveVal<float>("standoff_pa", cfg.standoffPaperMm);
         applyTargetGeometry();
         emitf("{\"type\":\"ok\",\"set\":\"standoffpaper\",\"value\":%.2f}\n", cfg.standoffPaperMm);
+    } else if (key == "MICHALFX") {
+        float v = val.toFloat();
+        if (v < 5.0f || v > 300.0f) { emitLine("{\"type\":\"error\",\"msg\":\"michalfx 5.0-300.0\"}\n"); return true; }
+        cfg.micHalfXMm = v;
+        saveVal<float>("mic_half_x", cfg.micHalfXMm);
+        applyMicHalfX();
+        emitf("{\"type\":\"ok\",\"set\":\"michalfx\",\"value\":%.2f}\n", cfg.micHalfXMm);
+    } else if (key == "BSHIFTPCT") {
+        long v = val.toInt();
+        if (v < 0 || v > 100) { emitLine("{\"type\":\"error\",\"msg\":\"bshiftpct 0-100\"}\n"); return true; }
+        cfg.bulletShiftPct = (uint8_t)v;
+        saveVal<uint8_t>("bshift_pct", cfg.bulletShiftPct);
+        emitf("{\"type\":\"ok\",\"set\":\"bshiftpct\",\"value\":%d}\n", cfg.bulletShiftPct);
+    } else if (key == "BSHIFTCAP") {
+        float v = val.toFloat();
+        if (v < 0.0f || v > 20.0f) { emitLine("{\"type\":\"error\",\"msg\":\"bshiftcap 0.0-20.0\"}\n"); return true; }
+        cfg.bulletShiftCapMm = v;
+        saveVal<float>("bshift_cap", cfg.bulletShiftCapMm);
+        emitf("{\"type\":\"ok\",\"set\":\"bshiftcap\",\"value\":%.2f}\n", cfg.bulletShiftCapMm);
     } else if (key == "PIEZO") {
         long v = val.toInt();
         if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"piezo 0|1\"}\n"); return true; }
@@ -1784,6 +2894,50 @@ static bool handleSet(const String &raw)
         saveVal<uint16_t>("sound_mps", cfg.soundSpeedMps);
         applySoundSpeed();
         emitf("{\"type\":\"ok\",\"set\":\"soundspeed\",\"value\":%u}\n", cfg.soundSpeedMps);
+    } else if (key == "PAPERFEED") {
+        float v = val.toFloat();
+        if (v < 10.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"paperfeed 10.0-100.0\"}\n"); return true; }
+        cfg.paperFeedMm = v;
+        saveVal<float>("paper_mm", cfg.paperFeedMm);
+        emitf("{\"type\":\"ok\",\"set\":\"paperfeed\",\"value\":%.2f}\n", cfg.paperFeedMm);
+    } else if (key == "PAPERSPEED") {
+        float v = val.toFloat();
+        if (v < 0.5f || v > 30.0f) { emitLine("{\"type\":\"error\",\"msg\":\"paperspeed 0.5-30.0\"}\n"); return true; }
+        cfg.paperSpeedMmS = v;
+        saveVal<float>("paper_mmps", cfg.paperSpeedMmS);
+        emitf("{\"type\":\"ok\",\"set\":\"paperspeed\",\"value\":%.2f}\n", cfg.paperSpeedMmS);
+    } else if (key == "PAPERAUTO") {
+        long v = val.toInt();
+        if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"paperauto 0|1\"}\n"); return true; }
+        cfg.paperAuto = (v == 1);
+        saveVal<bool>("paper_auto", cfg.paperAuto);
+        emitf("{\"type\":\"ok\",\"set\":\"paperauto\",\"value\":%d}\n", cfg.paperAuto ? 1 : 0);
+    } else if (key == "PAPERTRIGGER") {
+        String v = val; v.toUpperCase();
+        uint8_t newTrig;
+        if (v == "ANY")        newTrig = PAPER_TRIG_ANY;
+        else if (v == "PIEZO") newTrig = PAPER_TRIG_PIEZO;
+        else if (v == "CLEAN") newTrig = PAPER_TRIG_CLEAN;
+        else { emitLine("{\"type\":\"error\",\"msg\":\"papertrigger any|piezo|clean\"}\n"); return true; }
+        cfg.paperTrigger = newTrig;
+        saveVal<uint8_t>("paper_trig", cfg.paperTrigger);
+        emitf("{\"type\":\"ok\",\"set\":\"papertrigger\",\"value\":\"%s\"}\n", v.c_str());
+    } else if (key == "PAPERDIR") {
+        long v = val.toInt();
+        if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"paperdir 0|1\"}\n"); return true; }
+        cfg.paperDirInvert = (v == 1);
+        saveVal<bool>("paper_dir", cfg.paperDirInvert);
+        emitf("{\"type\":\"ok\",\"set\":\"paperdir\",\"value\":%d}\n", cfg.paperDirInvert ? 1 : 0);
+    } else if (key == "PAPERJOGSPEED") {
+        float v = val.toFloat();
+        if (v < PAPER_JOG_SPEED_MIN_MMPS || v > PAPER_JOG_SPEED_MAX_MMPS) {
+            emitf("{\"type\":\"error\",\"msg\":\"paperjogspeed %.1f-%.1f\"}\n",
+                  PAPER_JOG_SPEED_MIN_MMPS, PAPER_JOG_SPEED_MAX_MMPS);
+            return true;
+        }
+        cfg.paperJogSpeedMmS = v;
+        saveVal<float>("paper_jog", cfg.paperJogSpeedMmS);
+        emitf("{\"type\":\"ok\",\"set\":\"paperjogspeed\",\"value\":%.2f}\n", cfg.paperJogSpeedMmS);
     } else if (key == "CALSHOTS") {
         long v = val.toInt();
         if (v < 3 || v > MAX_CAL_SHOTS) { emitf("{\"type\":\"error\",\"msg\":\"calshots 3-%d\"}\n", MAX_CAL_SHOTS); return true; }
@@ -1821,6 +2975,7 @@ static bool handleSet(const String &raw)
     } else if (key == "STATIC") {
         long v = val.toInt();
         if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"static 0|1\"}\n"); return true; }
+        armNetWatchdogIfNeeded();
         cfg.staticIP = (v == 1);
         saveVal<bool>("static_ip", cfg.staticIP);
         emitf("{\"type\":\"ok\",\"set\":\"static_ip\",\"value\":%d,\"reboot_required\":true}\n",
@@ -1828,16 +2983,19 @@ static bool handleSet(const String &raw)
     } else if (key == "IP") {
         IPAddress tmp;
         if (!tmp.fromString(val)) { emitLine("{\"type\":\"error\",\"msg\":\"invalid IP address\"}\n"); return true; }
+        armNetWatchdogIfNeeded();
         cfg.ip = val; saveVal<String>("ip", val);
         emitf("{\"type\":\"ok\",\"set\":\"ip\",\"value\":\"%s\",\"reboot_required\":true}\n", val.c_str());
     } else if (key == "GW" || key == "GATEWAY") {
         IPAddress tmp;
         if (!tmp.fromString(val)) { emitLine("{\"type\":\"error\",\"msg\":\"invalid gateway address\"}\n"); return true; }
+        armNetWatchdogIfNeeded();
         cfg.gateway = val; saveVal<String>("gateway", val);
         emitf("{\"type\":\"ok\",\"set\":\"gateway\",\"value\":\"%s\",\"reboot_required\":true}\n", val.c_str());
     } else if (key == "SUBNET") {
         IPAddress tmp;
         if (!tmp.fromString(val)) { emitLine("{\"type\":\"error\",\"msg\":\"invalid subnet mask\"}\n"); return true; }
+        armNetWatchdogIfNeeded();
         cfg.subnet = val; saveVal<String>("subnet", val);
         emitf("{\"type\":\"ok\",\"set\":\"subnet\",\"value\":\"%s\",\"reboot_required\":true}\n", val.c_str());
     } else if (key == "DNS") {
@@ -1845,19 +3003,315 @@ static bool handleSet(const String &raw)
             IPAddress tmp;
             if (!tmp.fromString(val)) { emitLine("{\"type\":\"error\",\"msg\":\"invalid DNS address\"}\n"); return true; }
         }
+        armNetWatchdogIfNeeded();
         cfg.dns = val; saveVal<String>("dns", val);
         emitf("{\"type\":\"ok\",\"set\":\"dns\",\"value\":\"%s\",\"reboot_required\":true}\n", val.c_str());
+    } else if (key == "PSK") {
+        // TCP-Authentifizierung (siehe AUTH_PSK_DEFAULT_HEX oben) - bewusst
+        // KEIN armNetWatchdogIfNeeded()/reboot_required: wirkt wie die
+        // uebrigen Betriebsparameter sofort, ist kein Netzwerk-Feld im Sinne
+        // des Sicherheitsnetzes (Abschnitt 7.6 der Protokoll-Referenz).
+        if (val.length() != 64) {
+            emitLine("{\"type\":\"error\",\"msg\":\"psk muss 64 Hex-Zeichen (32 Byte) sein\"}\n");
+            return true;
+        }
+        for (size_t i = 0; i < val.length(); i++) {
+            if (hexNibble(val[i]) < 0) {
+                emitLine("{\"type\":\"error\",\"msg\":\"psk: ungueltiges Hex-Zeichen\"}\n");
+                return true;
+            }
+        }
+        cfg.pskHex = val; saveVal<String>("psk", val);
+        applyPskHex(val);
+        emitLine("{\"type\":\"ok\",\"set\":\"psk\"}\n"); // Wert nie zurueckspiegeln (wie PASS)
     } else {
         emitLine("{\"type\":\"error\",\"msg\":\"unknown key\"}\n");
     }
     return true;
 }
 
-static void handleCommand(const String &rawCmd)
+// ---------------------------------------------------------------------------
+// PIN-Diagnose - manuelles Setzen/Lesen einzelner GPIOs zur Hardware-/
+// Verkabelungsfehlersuche (z.B. Verdacht auf einen defekten Pin), unabhaengig
+// von der sonstigen Schuss-/Papiervorschub-Logik. NICHT NVS-persistent (wie
+// SET TESTMODE) - nach einem Reboot ist jeder Pin wieder in seinem normalen
+// Betriebszustand (siehe setup()).
+//
+// ACHTUNG: Positivliste bewusst eng gehalten. Wer einen Pin hierueber
+// umkonfiguriert, der gleichzeitig von einem anderen Subsystem genutzt wird
+// (hier: GPIO16-19/21 vom Papiervorschub, siehe PAPER_*_PIN), ueberschreibt
+// dessen Pin-Modus/-Pegel, bis der jeweils naechste Vorgang (Schritt-Impuls,
+// Schalter-Abfrage) das wieder passend setzt - fuer eine gezielte
+// Pin-Fehlersuche ist genau das gewuenscht, im laufenden Betrieb sollte man
+// diese Pins aber nicht gleichzeitig per PIN-Kommando anfassen.
+static const uint8_t PIN_DIAG_ALLOWED[] = {0, 2, 4, 15, 16, 17, 18, 19, 21};
+
+static bool pinDiagAllowed(int pin)
+{
+    for (size_t i = 0; i < sizeof(PIN_DIAG_ALLOWED); i++) {
+        if (PIN_DIAG_ALLOWED[i] == pin) return true;
+    }
+    return false;
+}
+
+// Merkt sich je Pin den zuletzt per PIN-Kommando gesetzten Modus - PIN <n>
+// READ liest damit einfach den aktuellen Pegel im zuletzt gesetzten Modus,
+// ohne pinMode() erneut aufzurufen (bei OUTPUT wuerde ein digitalRead() sonst
+// ohnehin nur den zuletzt geschriebenen Ausgangswert zurueckgeben, nicht den
+// externen Signalpegel - genau deshalb braucht READ vorher IN/PULLUP/
+// PULLDOWN, um wirklich den von aussen anliegenden Pegel zu sehen).
+enum PinDiagMode : uint8_t { PINDIAG_UNSET, PINDIAG_IN, PINDIAG_PULLUP, PINDIAG_PULLDOWN, PINDIAG_OUT };
+static PinDiagMode pinDiagMode[40] = { PINDIAG_UNSET };   // Index = GPIO-Nummer
+
+static const char *pinDiagModeName(PinDiagMode m)
+{
+    switch (m) {
+        case PINDIAG_IN:       return "in";
+        case PINDIAG_PULLUP:   return "pullup";
+        case PINDIAG_PULLDOWN: return "pulldown";
+        case PINDIAG_OUT:      return "out";
+        default:               return "unset";
+    }
+}
+
+static void pinDiagReport(int pin)
+{
+    emitf("{\"type\":\"pin\",\"gpio\":%d,\"mode\":\"%s\",\"level\":%d}\n",
+          pin, pinDiagModeName(pinDiagMode[pin]), digitalRead(pin));
+}
+
+// upperRest = alles nach "PIN " (bereits getrimmt/GROSS, siehe handleCommand())
+static void handlePinCommand(const String &upperRest)
+{
+    if (upperRest == "LIST") {
+        for (size_t i = 0; i < sizeof(PIN_DIAG_ALLOWED); i++) {
+            pinDiagReport(PIN_DIAG_ALLOWED[i]);
+        }
+        return;
+    }
+
+    int sp = upperRest.indexOf(' ');
+    if (sp < 0) {
+        emitLine("{\"type\":\"error\",\"msg\":\"pin syntax: PIN <n> IN|PULLUP|PULLDOWN|OUT=0|1|READ, or PIN LIST\"}\n");
+        return;
+    }
+    int    pin    = upperRest.substring(0, sp).toInt();
+    String action = upperRest.substring(sp + 1);
+    action.trim();
+
+    if (!pinDiagAllowed(pin)) {
+        emitf("{\"type\":\"error\",\"msg\":\"pin %d not allowed\"}\n", pin);
+        return;
+    }
+
+    if (action == "READ") {
+        if (pinDiagMode[pin] == PINDIAG_UNSET) {
+            emitf("{\"type\":\"error\",\"msg\":\"pin %d mode not set, use IN|PULLUP|PULLDOWN|OUT first\"}\n", pin);
+            return;
+        }
+    } else if (action == "IN") {
+        pinMode(pin, INPUT);
+        pinDiagMode[pin] = PINDIAG_IN;
+    } else if (action == "PULLUP") {
+        pinMode(pin, INPUT_PULLUP);
+        pinDiagMode[pin] = PINDIAG_PULLUP;
+    } else if (action == "PULLDOWN") {
+        pinMode(pin, INPUT_PULLDOWN);
+        pinDiagMode[pin] = PINDIAG_PULLDOWN;
+    } else if (action.startsWith("OUT=")) {
+        long v = action.substring(4).toInt();
+        if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"pin out 0|1\"}\n"); return; }
+        pinMode(pin, OUTPUT);
+        digitalWrite(pin, v ? HIGH : LOW);
+        pinDiagMode[pin] = PINDIAG_OUT;
+    } else {
+        emitLine("{\"type\":\"error\",\"msg\":\"pin action: IN|PULLUP|PULLDOWN|OUT=0|1|READ\"}\n");
+        return;
+    }
+    pinDiagReport(pin);
+}
+
+// ---------------------------------------------------------------------------
+// ACTION-Namensraum (Rev 4.9.0) - kurzlebige Bedienbefehle, bewusst getrennt
+// von SET (das persistente Konfiguration ist): siehe docs/remote-
+// interaktion-konzept.md Abschnitt 6. upperRest = alles nach "ACTION "
+// (bereits getrimmt/GROSS, siehe handleCommand()).
+// ---------------------------------------------------------------------------
+static void handleActionCommand(const String &upperRest)
+{
+    if (upperRest.startsWith("LIGHT=")) {
+        String v = upperRest.substring(6);
+        if (v == "ON")        { lightOverride = LIGHT_FORCE_ON;  digitalWrite(LIGHT_PIN, HIGH); }
+        else if (v == "OFF")  { lightOverride = LIGHT_FORCE_OFF; digitalWrite(LIGHT_PIN, LOW); }
+        else if (v == "AUTO") { lightOverride = LIGHT_AUTO; }
+        else {
+            emitLine("{\"type\":\"error\",\"msg\":\"action light on|off|auto\"}\n");
+            return;
+        }
+        emitf("{\"type\":\"ok\",\"action\":\"light\",\"state\":\"%s\"}\n",
+              lightOverride == LIGHT_FORCE_ON ? "on"
+                  : (lightOverride == LIGHT_FORCE_OFF ? "off" : "auto"));
+        return;
+    }
+    if (upperRest == "TARGETCHANGE") {
+        // Identischer Codepfad wie TESTSHOOTPAPER (siehe dortigen Kommentar)
+        // - eigener, fuer den produktiven Scheibenwechsel sprechender Name.
+        if (paperMode != PAPER_IDLE) {
+            emitLine("{\"type\":\"error\",\"msg\":\"paper feed busy\"}\n");
+            return;
+        }
+        startPaperFeed();
+        emitLine("{\"type\":\"ok\",\"action\":\"targetchange\"}\n");
+        return;
+    }
+    emitLine("{\"type\":\"error\",\"msg\":\"unknown action\"}\n");
+}
+
+// ---------------------------------------------------------------------------
+// TESTSHOOT [<z_mm>] - synthetischer Testschuss zum Pruefen der Kommunikations-
+// strecke zum Stand-PC, OHNE echte Sensorik/Munition. Waehlt x/y zufaellig
+// gleichverteilt in [-z_mm, +z_mm] mm (Default z_mm=25.0, "gesamte LG-
+// Scheibe"), berechnet daraus fuer jeden aktiven Mikrofonkanal (SET MICEN0..
+// MICEN5) die nach AKTUELLER Kalibrierung (SET OFS0..OFS5, Zielgeometrie
+// SET TARGET/STANDOFFSTEEL/STANDOFFPAPER/MICHALFX, SET SOUNDSPEED) passende
+// Rohlaufzeit und speist sie GENAU in dieselben Puffer ein, die sonst
+// airISR()/piezoISR() fuellen (airCC/airCount/firstAirCC/firstHitTimeUs/
+// piezoCC/piezoSeen/shotInProgress). Der weitere Ablauf (Fensterlogik in
+// loop(), processShot(), automatischer Papiervorschub, ggf. CAL-Sammlung)
+// laeuft DANACH unveraendert wie bei einem echten Schuss - dadurch entsteht
+// ein regulaeres "shot"- (oder ggf. "reject"-)Telegramm inkl. air_ns = den
+// soeben erzeugten Rohwerten, ohne jede Sonderbehandlung im Auswertungscode.
+// Einziger Unterschied nach aussen: das zusaetzliche "synthetic":1-Feld
+// (siehe syntheticShotPending/processShot()), damit der Stand-PC einen
+// Testschuss klar von einem echten Treffer unterscheiden kann.
+// ---------------------------------------------------------------------------
+static void handleTestShoot(float zMm)
+{
+    if (shotInProgress) {
+        emitLine("{\"type\":\"error\",\"msg\":\"shot in progress\"}\n");
+        return;
+    }
+    const uint64_t nowUs = (uint64_t)esp_timer_get_time();
+    if (nowUs < lockoutUntil) {
+        emitLine("{\"type\":\"error\",\"msg\":\"debounce active\"}\n");
+        return;
+    }
+    if (calActive) {
+        // Wuerde sonst als (voellig unrealistisch "perfekter") Kalibrier-
+        // Schuss in CAL START einfliessen und eine echte Kalibrierung
+        // verfaelschen - siehe runCalibration()/calCost().
+        emitLine("{\"type\":\"error\",\"msg\":\"testshoot not allowed during active calibration\"}\n");
+        return;
+    }
+
+    const long xUm = random(-(long)(zMm * 1000.0f), (long)(zMm * 1000.0f) + 1);
+    const long yUm = random(-(long)(zMm * 1000.0f), (long)(zMm * 1000.0f) + 1);
+    const float xMm = (float)xUm / 1000.0f;
+    const float yMm = (float)yUm / 1000.0f;
+
+    // Rohlaufzeiten je Mikrofon (Schallausbreitung vom synthetischen
+    // Trefferpunkt) - dieselbe Geometrie (MIC_X/MIC_Y/micStandoffMm) und
+    // Schallgeschwindigkeit (soundMmPerNs) wie in solveAirPosition().
+    float rawToFNs[NUM_AIR];
+    bool  seen[NUM_AIR];
+    float minToFNs = 0.0f;
+    bool  haveMin  = false;
+    for (int i = 0; i < NUM_AIR; i++) {
+        seen[i] = cfg.micEnabled[i];
+        if (!seen[i]) continue;
+        float dx   = xMm - MIC_X[i], dy = yMm - MIC_Y[i];
+        float dist = sqrtf(dx * dx + dy * dy + micStandoffMm * micStandoffMm);
+        rawToFNs[i] = dist / soundMmPerNs;
+        if (!haveMin || rawToFNs[i] < minToFNs) { minToFNs = rawToFNs[i]; haveMin = true; }
+    }
+    if (!haveMin) {
+        emitLine("{\"type\":\"error\",\"msg\":\"testshoot: no mic enabled (SET MICEN0..MICEN5)\"}\n");
+        return;
+    }
+
+    // Piezo-Verzoegerung relativ zum ersten Luft-Ereignis, konsistent mit
+    // processShot()/piezoOk (siehe Rev-4.3-Hinweis im Header-Kommentar):
+    // STEEL = quasi-latenzfrei (Kontaktschall direkt auf der Platte, dient
+    // hier als zeitlicher Nullpunkt - Luft-Mics kommen danach), PAPER =
+    // Laufzeit durch die Papier->Stahl-Luecke, mittig im erlaubten Fenster
+    // SET PIEZOMIN..PIEZOMAX gewaehlt.
+    const bool  usePiezoNow   = cfg.usePiezo;
+    const float piezoTargetNs = (cfg.targetMode == TARGET_STEEL)
+        ? 0.0f
+        : (float)(cfg.piezoMinUs + cfg.piezoMaxUs) * 1000.0f / 2.0f;
+
+    noInterrupts();
+    // Anker fuer alle synthetischen Zeiten dieses Fensters - reiner
+    // Momentaufnahme-Wert, kein echtes ISR-Ereignis. airCC[i][0]/piezoCC
+    // werden unten als (firstAirCC + gewuenschtes Delta in CPU-Zyklen)
+    // gesetzt - dieselbe wrap-sichere uint32_t-Arithmetik wie beim
+    // Auslesen in processShot() ("dCC = localAirCC[i][e] - localFirstAirCC").
+    firstAirCC = esp_cpu_get_cycle_count();
+    for (int i = 0; i < NUM_AIR; i++) {
+        if (!seen[i]) { airCount[i] = 0; continue; }
+        // STEEL: Nullpunkt = Piezo (quasi-latenzfrei), Mics kommen danach.
+        // PAPER: Nullpunkt = fruehestes Mikrofon (minToFNs).
+        float targetNs = (cfg.targetMode == TARGET_STEEL)
+            ? rawToFNs[i] : (rawToFNs[i] - minToFNs);
+        float   rawNsWithOffset = targetNs + (float)cfg.micOffsetNs[i];
+        int32_t dCC = (int32_t)lroundf(rawNsWithOffset * (float)cpuMHz / 1000.0f);
+        airCC[i][0] = firstAirCC + (uint32_t)dCC;
+        airCount[i] = 1;
+    }
+    if (usePiezoNow) {
+        int32_t dCCPiezo = (int32_t)lroundf(piezoTargetNs * (float)cpuMHz / 1000.0f);
+        piezoCC   = firstAirCC + (uint32_t)dCCPiezo;
+        piezoSeen = true;
+    } else {
+        piezoCC   = 0;
+        piezoSeen = false;
+    }
+    firstHitTimeUs       = nowUs;
+    syntheticShotPending = true;
+    shotInProgress       = true;
+    interrupts();
+
+    emitf("{\"type\":\"ok\",\"cmd\":\"testshoot\",\"z_mm\":%.2f,"
+          "\"target_x_um\":%ld,\"target_y_um\":%ld}\n",
+          zMm, xUm, yUm);
+}
+
+static void handleCommand(const String &rawCmd, bool viaTcp)
 {
     String raw = rawCmd;
     raw.trim();
     if (raw.length() == 0) return;
+
+    // Authentifizierung (nur TCP, nur wenn ein Schluessel konfiguriert ist -
+    // siehe AUTH_PSK_DEFAULT_HEX/verifyIncomingIfTcp oben): VOR dem
+    // Korrelations-ID-Parsing pruefen, damit ein nicht authentifizierter
+    // Aufrufer nicht einmal eine mit "corr" versehene Fehlerantwort
+    // provozieren kann.
+    if (!verifyIncomingIfTcp(raw, viaTcp)) {
+        emitLine("{\"type\":\"error\",\"msg\":\"auth\"}\n");
+        return;
+    }
+
+    // Korrelations-ID (" #<id>", siehe pendingCorrId): abtrennen, BEVOR der
+    // eigentliche Befehl geparst wird - der Rest der Funktion sieht davon
+    // nichts mehr. pollCommands() setzt pendingCorrId nach dem Aufruf dieser
+    // Funktion wieder zurueck. Bewusst NUR ein rein numerischer Suffix nach
+    // " #" wird erkannt, alles andere (z.B. ein woertliches "#" in SET
+    // PASS=...) bleibt unangetastet Teil des Befehls.
+    pendingCorrId = -1;
+    int hashIdx = raw.lastIndexOf(" #");
+    if (hashIdx >= 0) {
+        String idStr = raw.substring(hashIdx + 2);
+        bool allDigits = idStr.length() > 0;
+        for (size_t i = 0; i < idStr.length() && allDigits; i++) {
+            if (!isDigit(idStr[i])) allDigits = false;
+        }
+        if (allDigits) {
+            pendingCorrId = idStr.toInt();
+            raw = raw.substring(0, hashIdx);
+            raw.trim();
+        }
+    }
 
     // Nur fuer Schluesselwort-Vergleich eine Gross-Kopie anlegen
     String upper = raw;
@@ -1867,7 +3321,51 @@ static void handleCommand(const String &rawCmd)
         handleSet(raw);                       // Original wg. case-sensitiver Werte
         return;
     }
+    if (upper.startsWith("ACTION ")) {
+        String rest = upper.substring(7);
+        rest.trim();
+        handleActionCommand(rest);
+        return;
+    }
+    if (upper.startsWith("NET")) {
+        String sub = upper.substring(3);
+        sub.trim();
+        if (sub == "CONFIRM") {
+            // Darf bewusst erst NACH dem Reboot in die neuen Werte bestaetigt
+            // werden (netWatchdogArmed==true) - eine Bestaetigung VOR dem
+            // Reboot wuerde das Sicherheitsnetz aufheben, ohne dass die neuen
+            // Werte je erreichbar waren (siehe armNetWatchdogIfNeeded()/
+            // serviceNetWatchdog()).
+            if (!netWatchdogArmed) {
+                emitLine(netPendingLoaded
+                    ? "{\"type\":\"error\",\"msg\":\"reboot required before confirming\"}\n"
+                    : "{\"type\":\"error\",\"msg\":\"no pending network change\"}\n");
+                return;
+            }
+            prefs.begin(NVS_NS, false);
+            prefs.putBool("net_pnd", false);
+            prefs.end();
+            netWatchdogArmed         = false;
+            netSnapshotArmedThisBoot = false;
+            netPendingLoaded         = false;
+            emitLine("{\"type\":\"ok\",\"cmd\":\"net_confirm\"}\n");
+        } else if (sub == "STATUS") {
+            if (netWatchdogArmed) {
+                uint32_t remainMs = netWatchdogDeadlineMs - millis();
+                emitf("{\"type\":\"net\",\"pending\":true,\"confirm_deadline_s\":%u}\n",
+                      (unsigned)(remainMs / 1000));
+            } else if (netPendingLoaded) {
+                emitLine("{\"type\":\"net\",\"pending\":true,\"reboot_required\":true}\n");
+            } else {
+                emitLine("{\"type\":\"net\",\"pending\":false}\n");
+            }
+        } else {
+            emitLine("{\"type\":\"error\",\"msg\":\"unknown net command\"}\n");
+        }
+        return;
+    }
     if (upper == "SHOW")    { sendShowConfig(); return; }
+    if (upper == "SHOWNET") { sendShowNetConfig(); return; }
     if (upper == "HELP" || upper == "?") { sendHelp(); return; }
     if (upper == "PING")    { emitLine("{\"type\":\"pong\"}\n"); return; }
     if (upper == "STATUS")  { sendStatus(); return; }
@@ -1888,6 +3386,37 @@ static void handleCommand(const String &rawCmd)
         sequenceNo  = 0;
         resetShotState();
         emitLine("{\"type\":\"ok\",\"cmd\":\"reset\"}\n");
+        return;
+    }
+    if (upper == "TESTSHOOTPAPER") {
+        // Loest NUR den Papiervorschub aus, so als waere gerade ein Schuss
+        // registriert worden - zum Testen von Mechanik/Treiber ohne echten
+        // Schuss auf die Scheibe. Bewusst UNABHAENGIG von PAPERAUTO/
+        // PAPERTRIGGER (das sind Filter fuer ECHTE Schuesse) und OHNE
+        // shotCounter/sequenceNo zu erhoehen oder ein "shot"-Telegramm zu
+        // senden - der Stand-PC soll dadurch keinen echten Treffer sehen.
+        if (paperMode != PAPER_IDLE) {
+            emitLine("{\"type\":\"error\",\"msg\":\"paper feed busy\"}\n");
+            return;
+        }
+        startPaperFeed();
+        emitLine("{\"type\":\"ok\",\"cmd\":\"testshootpaper\"}\n");
+        return;
+    }
+    if (upper == "TESTSHOOT" || upper.startsWith("TESTSHOOT ")) {
+        // Absichtlich per Leerzeichen von TESTSHOOTPAPER (oben) abgegrenzt -
+        // "TESTSHOOTPAPER" selbst matcht keinen der beiden Faelle hier.
+        float zMm = 25.0f;   // Default: gesamte LG-Scheibe
+        if (upper.length() > 9) {
+            String zStr = upper.substring(9);
+            zStr.trim();
+            if (zStr.length() > 0) zMm = zStr.toFloat();
+        }
+        if (zMm < 1.0f || zMm > 500.0f) {
+            emitLine("{\"type\":\"error\",\"msg\":\"testshoot z 1.0-500.0\"}\n");
+            return;
+        }
+        handleTestShoot(zMm);
         return;
     }
     if (upper.startsWith("CAL")) {
@@ -1915,9 +3444,76 @@ static void handleCommand(const String &rawCmd)
             saveVal<uint16_t>("sound_mps", cfg.soundSpeedMps);
             applySoundSpeed();
             emitLine("{\"type\":\"ok\",\"cmd\":\"cal_reset\"}\n");
+        } else if (sub.startsWith("IMPORT")) {
+            // Atomarer Bulk-Restore einer vom Stand-PC gespeicherten
+            // Kalibrierung (Rev 4.9.0, siehe docs/remote-interaktion-
+            // konzept.md Abschnitt 7.2): "CAL IMPORT OFS0=<ns>,...,
+            // OFS5=<ns>,SOUNDSPEED=<mps>" - alle Werte zuerst validieren,
+            // ERST DANACH schreiben, damit ein Abbruch mitten in der
+            // Uebertragung (z.B. TCP-Verbindungsverlust) keinen
+            // inkonsistenten Zwischenzustand hinterlaesst (anders als bei
+            // einer Folge einzelner SET OFS<i>-Befehle).
+            String rest = sub.substring(6);
+            rest.trim();
+            int32_t newOfs[NUM_AIR];
+            bool    setOfs[NUM_AIR];
+            for (int i = 0; i < NUM_AIR; i++) { newOfs[i] = cfg.micOffsetNs[i]; setOfs[i] = false; }
+            uint16_t newSound = cfg.soundSpeedMps;
+            bool     setSound = false;
+            bool     ok = (rest.length() > 0);
+            int      start = 0;
+            while (ok && start <= (int)rest.length()) {
+                int comma = rest.indexOf(',', start);
+                String tok = (comma < 0) ? rest.substring(start) : rest.substring(start, comma);
+                tok.trim();
+                if (tok.length() > 0) {
+                    int eq = tok.indexOf('=');
+                    if (eq < 1) { ok = false; break; }
+                    String k = tok.substring(0, eq); k.trim();
+                    long   v = tok.substring(eq + 1).toInt();
+                    if (k.startsWith("OFS") && k.length() == 4 && isDigit(k[3])) {
+                        int idx = k[3] - '0';
+                        if (idx >= NUM_AIR || v < -MIC_OFS_MAX_NS || v > MIC_OFS_MAX_NS) { ok = false; break; }
+                        newOfs[idx] = (int32_t)v;
+                        setOfs[idx] = true;
+                    } else if (k == "SOUNDSPEED") {
+                        if (v < SOUND_SPEED_MIN_MPS || v > SOUND_SPEED_MAX_MPS) { ok = false; break; }
+                        newSound  = (uint16_t)v;
+                        setSound  = true;
+                    } else {
+                        ok = false; break;
+                    }
+                }
+                if (comma < 0) break;
+                start = comma + 1;
+            }
+            if (!ok) {
+                emitLine("{\"type\":\"error\",\"msg\":\"cal import: bad key=value "
+                         "(OFS0..OFS5=-20000..20000, SOUNDSPEED=300..400)\"}\n");
+                return;
+            }
+            for (int i = 0; i < NUM_AIR; i++) {
+                if (!setOfs[i]) continue;
+                cfg.micOffsetNs[i] = newOfs[i];
+                char key2[8];
+                snprintf(key2, sizeof(key2), "ofs%d", i);
+                saveVal<int32_t>(key2, newOfs[i]);
+            }
+            if (setSound) {
+                cfg.soundSpeedMps = newSound;
+                saveVal<uint16_t>("sound_mps", newSound);
+                applySoundSpeed();
+            }
+            emitLine("{\"type\":\"ok\",\"cmd\":\"cal_import\"}\n");
         } else {
             emitLine("{\"type\":\"error\",\"msg\":\"unknown cal command\"}\n");
         }
+        return;
+    }
+    if (upper.startsWith("PIN")) {
+        String rest = upper.substring(3);
+        rest.trim();
+        handlePinCommand(rest);
         return;
     }
     // Kurzformen aus Rev 3.0/3.1 – jetzt ebenfalls persistent:
@@ -1930,17 +3526,25 @@ static void handleCommand(const String &rawCmd)
 // echo: Zeichen sofort auf s zurückschreiben (fuer Terminals ohne lokales
 // Echo, z.B. MobaXterm seriell). Beim TCP-Kanal AUS, da die Gegenstelle
 // dort reines JSON erwartet.
-static void pollCommands(Stream &s, String &buf, bool echo)
+// AUTH_CMD_BUF_LEN: max. Laenge einer eingehenden Kommandozeile. War vorher
+// fest 96 - reichte fuer die laengste dokumentierte Zeile (CAL IMPORT
+// OFS0=...,...,SOUNDSPEED=... #<id>, siehe protokoll-referenz.md Abschnitt
+// 5.3) schon vorher kaum, und braucht jetzt zusaetzlich Platz fuer das
+// AUTH_TAG_HEX_LEN+1 Zeichen lange Signatur-Praefix auf dem TCP-Kanal.
+#define AUTH_CMD_BUF_LEN  220
+
+static void pollCommands(Stream &s, String &buf, bool echo, bool viaTcp)
 {
     while (s.available() > 0) {
         char c = (char)s.read();
         if (echo) s.write(c);
         if (c == '\n' || c == '\r') {
             if (buf.length() > 0) {
-                handleCommand(buf);
+                handleCommand(buf, viaTcp);
+                pendingCorrId = -1;   // siehe Kommentar bei pendingCorrId/emitLine()
                 buf = "";
             }
-        } else if (buf.length() < 96) {
+        } else if (buf.length() < AUTH_CMD_BUF_LEN) {
             buf += c;
         }
     }
@@ -1975,16 +3579,148 @@ static void maintainNetwork()
     }
 }
 
+// Sicherheitsnetz fuer Netzwerk-Fernkonfiguration (Rev 4.9.0, siehe
+// armNetWatchdogIfNeeded() und den Rev-4.9.0-Hinweis im Header-Kommentar):
+// laeuft NUR nach einem Boot mit noch unbestaetigtem "net_pnd"-Flag
+// (netWatchdogArmed, siehe setup()). Bestaetigt niemand die neue Konfig-
+// uration per NET CONFIRM innerhalb von NET_CONFIRM_TIMEOUT_MS, werden die
+// zuletzt bestaetigten Werte ("*_prv"-NVS-Keys) zurueckgeschrieben und das
+// Geraet neu gestartet - rein zeitbasiert (kein tcp.connected()-Check
+// noetig), deckt damit auch den Fall ab, dass WLAN mit den neuen Werten gar
+// nicht erst verbindet (z.B. falsches SSID/PASS).
+static void serviceNetWatchdog()
+{
+    if (!netWatchdogArmed) return;
+    if ((int32_t)(millis() - netWatchdogDeadlineMs) < 0) return;
+
+    Serial.println("# Netzwerk-Aenderung nicht bestaetigt (NET CONFIRM) - "
+                    "stelle vorherige Konfiguration wieder her und starte neu");
+    prefs.begin(NVS_NS, false);
+    String pssid    = prefs.getString("ssid_prv", "");
+    String ppass    = prefs.getString("pass_prv", "");
+    String phost    = prefs.getString("host_prv", "192.168.1.10");
+    uint16_t pport  = prefs.getUShort("port_prv", 9000);
+    bool     pstatc = prefs.getBool("static_prv", false);
+    String pip      = prefs.getString("ip_prv", "");
+    String pgw      = prefs.getString("gw_prv", "");
+    String psubnet  = prefs.getString("subnet_prv", "255.255.255.0");
+    String pdns     = prefs.getString("dns_prv", "");
+    prefs.putString("ssid", pssid);
+    prefs.putString("pass", ppass);
+    prefs.putString("host", phost);
+    prefs.putUShort("port", pport);
+    prefs.putBool("static_ip", pstatc);
+    prefs.putString("ip", pip);
+    prefs.putString("gateway", pgw);
+    prefs.putString("subnet", psubnet);
+    prefs.putString("dns", pdns);
+    prefs.putBool("net_pnd", false);
+    prefs.end();
+    delay(100);
+    ESP.restart();
+}
+
+// Standbeleuchtung: an setup() bereits eingeschaltet (siehe dort). Solange
+// tcp.connected(), bleibt sie an. Faellt die TCP-Verbindung weg (oder steht
+// sie seit dem Boot noch nie), durchlaeuft sie den LightPhase-Automaten:
+// nach LIGHT_GRACE_MS aus, nach weiteren LIGHT_BLINK_DELAY_MS bei
+// bestehendem WLAN ein kurzer Diagnose-Blink (LIGHT_BLINK_DURATION_MS),
+// danach endgueltig aus - bis die TCP-Verbindung wieder steht und der
+// gesamte Zyklus bei einem erneuten Abbruch von vorn beginnt.
+static void serviceLight()
+{
+    // ACTION LIGHT=ON|OFF: uebernimmt den Pin komplett, die automatische
+    // Verbindungsanzeige (inkl. LightPhase-Automat) pausiert dabei - siehe
+    // handleActionCommand(). ACTION LIGHT=AUTO gibt die Kontrolle zurueck,
+    // ab dann greift der Automat wieder ab dem naechsten tcp.connected()-
+    // Wechsel wie gewohnt.
+    if (lightOverride != LIGHT_AUTO) {
+        digitalWrite(LIGHT_PIN, lightOverride == LIGHT_FORCE_ON ? HIGH : LOW);
+        return;
+    }
+
+    const bool     connected = tcp.connected();
+    const uint32_t now       = millis();
+
+    if (connected) {
+        digitalWrite(LIGHT_PIN, HIGH);
+        lightWasConnected = true;
+        lightPhase   = LP_WAIT_CONN;
+        lightPhaseMs = now;
+        return;
+    }
+
+    if (lightWasConnected) {
+        // Gerade erst die Verbindung verloren - Zyklus (LED an, Gnadenfrist)
+        // von vorn beginnen.
+        lightWasConnected = false;
+        lightPhase   = LP_WAIT_CONN;
+        lightPhaseMs = now;
+    }
+
+    switch (lightPhase) {
+    case LP_WAIT_CONN:
+        if (now - lightPhaseMs >= LIGHT_GRACE_MS) {
+            digitalWrite(LIGHT_PIN, LOW);
+            lightPhase   = LP_OFF_WAIT;
+            lightPhaseMs = now;
+        }
+        break;
+    case LP_OFF_WAIT:
+        if (now - lightPhaseMs >= LIGHT_BLINK_DELAY_MS) {
+            if (WiFi.status() == WL_CONNECTED) {
+                digitalWrite(LIGHT_PIN, HIGH);
+                lightPhase = LP_BLINK;
+            } else {
+                lightPhase = LP_OFF_DONE;
+            }
+            lightPhaseMs = now;
+        }
+        break;
+    case LP_BLINK:
+        if (now - lightPhaseMs >= LIGHT_BLINK_DURATION_MS) {
+            digitalWrite(LIGHT_PIN, LOW);
+            lightPhase   = LP_OFF_DONE;
+            lightPhaseMs = now;
+        }
+        break;
+    case LP_OFF_DONE:
+        break;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Setup / Loop
 // ---------------------------------------------------------------------------
 
 void setup()
 {
+    // Beleuchtung sofort an, noch vor allem anderen (siehe serviceLight()
+    // fuer das Abschalten falls binnen LIGHT_GRACE_MS keine TCP-Session
+    // zum Host zustande kommt).
+    pinMode(LIGHT_PIN, OUTPUT);
+    digitalWrite(LIGHT_PIN, HIGH);
+    lightPhaseMs = millis();
+
     Serial.begin(SERIAL_BAUD);
+    initDeviceMac();
     loadConfig();
     applyTargetGeometry();
+    applyMicHalfX();
     applySoundSpeed();
+
+    // Sicherheitsnetz Netzwerk-Fernkonfiguration (Rev 4.9.0): war beim
+    // letzten Boot ein "net_pnd"-Flag gesetzt (loadConfig() hat es bereits
+    // nach netPendingLoaded gelesen), wurde die soeben geladene Konfiguration
+    // noch NICHT per NET CONFIRM bestaetigt - Watchdog scharf schalten.
+    // netSnapshotArmedThisBoot wird ebenfalls vorbelegt, damit ein weiterer
+    // Netzwerk-SET-Befehl vor der Bestaetigung die "*_prv"-Werte (= die
+    // zuletzt BESTAETIGTE Konfiguration) nicht ueberschreibt.
+    netSnapshotArmedThisBoot = netPendingLoaded;
+    if (netPendingLoaded) {
+        netWatchdogArmed      = true;
+        netWatchdogDeadlineMs = millis() + NET_CONFIRM_TIMEOUT_MS;
+    }
 
     // CPU-Takt fuer die Zyklen->ns-Umrechnung ermitteln
     cpuMHz = getCpuFrequencyMhz();
@@ -1993,9 +3729,10 @@ void setup()
     // Alle ISRs auf gleichem Core (setup laeuft auf einem Core), damit
     // alle Mikrofone denselben Zykluszaehler benutzen.
     for (uint32_t i = 0; i < NUM_AIR; i++) {
-        // GPIO34-39 (hier: 35, siehe Diagnose-Hinweis bei AIR_PINS[] oben)
-        // haben KEINEN internen Pull-Up - normaler INPUT-Modus, das LM339
-        // muss (wie bei PIEZO_PIN bereits der Fall) aktiv treiben.
+        // GPIO34-39 haben KEINEN internen Pull-Up - normaler INPUT-Modus,
+        // das LM339 muss (wie bei PIEZO_PIN bereits der Fall) aktiv treiben.
+        // Aktuell betrifft das keinen der AIR_PINS (nur den Sonderfall aus
+        // dem inzwischen zurueckgebauten Diagnose-Test 3, siehe Header).
         bool noPullup = AIR_PINS[i] >= 34 && AIR_PINS[i] <= 39;
         pinMode(AIR_PINS[i], noPullup ? INPUT : INPUT_PULLUP);
         attachInterruptArg(digitalPinToInterrupt(AIR_PINS[i]),
@@ -2008,6 +3745,17 @@ void setup()
     pinMode(PIEZO_PIN, INPUT);
     attachInterrupt(digitalPinToInterrupt(PIEZO_PIN), piezoISR, RISING);
     resetShotState();
+
+    // Papiervorschub (siehe servicePaperStepper() oben): Treiber zunaechst
+    // deaktiviert (EN=HIGH), Einfaedel-Schalter mit internem Pull-Up (aktiv
+    // = LOW gegen GND).
+    pinMode(PAPER_STEP_PIN, OUTPUT);
+    pinMode(PAPER_DIR_PIN, OUTPUT);
+    pinMode(PAPER_EN_PIN, OUTPUT);
+    digitalWrite(PAPER_STEP_PIN, LOW);
+    paperEnable(false);
+    pinMode(PAPER_SW_FWD_PIN, INPUT_PULLUP);
+    pinMode(PAPER_SW_REV_PIN, INPUT_PULLUP);
 
     wifiEnabled = cfg.ssid.length() > 0;
     if (wifiEnabled) {
@@ -2127,11 +3875,15 @@ void loop()
         }
     }
 
+    servicePaperStepper();
+
     maintainNetwork();
+    serviceNetWatchdog();
+    serviceLight();
 
     static String serialBuf, tcpBuf;
-    pollCommands(Serial, serialBuf, true);
+    pollCommands(Serial, serialBuf, true, false);   // Serial: kein Auth (physischer Zugriff)
     if (tcp.connected()) {
-        pollCommands(tcp, tcpBuf, false);
+        pollCommands(tcp, tcpBuf, false, true);     // TCP: Auth, falls PSK konfiguriert
     }
 }

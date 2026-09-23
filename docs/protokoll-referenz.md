@@ -193,11 +193,12 @@ Gesendet: auf `SHOW`-Befehl, und automatisch am Ende von `CAL START`
  "window_ms":1,"debug":0,
  "outlier_um":5000,"cluster_radius_um":200,"min_cluster_hits":2,
  "max_precision_um":2000,"min_mics":5,"tdoa_us":750,
- "mic_offset_ns":[0,0,0,0,0,0],"mic_enabled":[1,1,1,1,1,1],"cal_shots":5,
+ "mic_offset_ns":[0,0,0,0,0,0],"mic_enabled":[1,1,1,1,1,1],"cal_shots":10,
  "target":"steel","standoff_steel_mm":30.00,"standoff_paper_mm":28.00,
  "mic_half_x_mm":115.00,"bullet_shift_pct":50,"bullet_shift_cap_mm":3.00,
+ "algo":"classic","pellet_r_mm":2.25,"max_sigma_um":2000,
  "use_piezo":1,"piezo_min_us":100,"piezo_max_us":1400,
- "test_cooldown_ms":3000,"offset_x_um":0,"offset_y_um":0,"sound_mps":355,
+ "test_cooldown_ms":3000,"offset_x_um":0,"offset_y_um":0,"sound_mps":343,
  "paper_feed_mm":50.00,"paper_speed_mmps":5.00,"paper_auto":1,
  "paper_trigger":"piezo","paper_dir_invert":1,"paper_jog_speed_mmps":75.00}
 ```
@@ -258,7 +259,8 @@ Stand-PC-Seite):
 | Feld | Typ | Bedeutung |
 |---|---|---|
 | `seq` | uint | fortlaufende Sequenznummer, gemeinsam mit `shot` (siehe unten) |
-| `reason` | string | aktuell immer `"only <n> mic(s)"` (einzige Reject-Ursache in dieser Firmware-Version) |
+| `algo` | `"classic"` oder `"rim"` | **seit Rev 4.11.0**: welcher Auswertepfad (`SET ALGO`) dieses Telegramm erzeugt hat - wichtig, weil `air_ns`/die übrigen Feldnamen je nach Pfad unterschiedlich zu interpretieren sind (siehe 4.5b) |
+| `reason` | string | bei `algo:"classic"` immer `"only <n> mic(s)"`; bei `algo:"rim"` zusätzlich möglich: `"fit failed"` (Gate/Ausgleichsrechnung ohne Lösung trotz genug Mikrofonen) |
 | `hits` | int | Anzahl Mikrofone, die ausgelöst haben (nach `SET MICEN<i>`-Maskierung) |
 | `piezo_ns` | int oder `null` | nur vorhanden, wenn `SET PIEZO=1`: Verzögerung des Piezo-Signals relativ zum ersten Luftschall-Ereignis in ns, oder `null` falls Piezo nicht ausgelöst hat. **Feld fehlt komplett**, wenn `SET PIEZO=0`. |
 | `synthetic` | 1, sonst fehlt das Feld | **nur bei `TESTSHOOT`** (seit Rev 4.9.1, siehe 5.8/7.7): markiert einen synthetischen Testschuss - bei echten Auslösungen fehlt dieses Feld komplett |
@@ -277,7 +279,8 @@ Stand-PC-Seite):
 | Feld | Typ | Bedeutung |
 |---|---|---|
 | `seq` | uint | fortlaufende Sequenznummer über **alle** Auslösungen (shot+reject zusammen), beginnt bei 1 nach Boot oder `RESET`-Befehl, **überläuft nicht in der Praxis** (uint32) |
-| `air_ns` | Array[6] von Arrays | pro Mikrofonkanal (Index = Kanal, siehe 7.1) alle erfassten Flankenzeiten in ns relativ zum ersten Ereignis des Fensters (`firstAirCC`); leeres Array `[]` = Kanal hat in diesem Fenster nicht ausgelöst; **erste Flanke pro Kanal** (`air_ns[i][0]`) ist die für die Positionslösung verwendete Zeit; weitere Flanken (Nachschwinger/Mehrfachtrigger) sind rein informativ |
+| `algo` | `"classic"` oder `"rim"` | **seit Rev 4.11.0**, siehe oben bei `reject` und 4.5b |
+| `air_ns` | Array[6] von Arrays | **nur bei `algo:"classic"`** (siehe 4.5b für `algo:"rim"`): pro Mikrofonkanal (Index = Kanal, siehe 7.1) alle erfassten Flankenzeiten in ns relativ zum ersten Ereignis des Fensters (`firstAirCC`); leeres Array `[]` = Kanal hat in diesem Fenster nicht ausgelöst; **erste Flanke pro Kanal** (`air_ns[i][0]`) ist die für die Positionslösung verwendete Zeit; weitere Flanken (Nachschwinger/Mehrfachtrigger) sind rein informativ |
 | `x_um_pre`,`y_um_pre`,`precision_um_pre`,`cluster_hits_pre` | — | **nur bei `SET DEBUG=3`**: Roh-Position vor dem Verifizierungsschritt (siehe 7.3), zum Vergleich mit dem finalen Ergebnis |
 | `x_um`,`y_um` | int (0.001 mm) | finale Trefferposition im Zielkoordinatensystem (Ursprung = Scheiben-/Plattenzentrum, siehe 7.2), inkl. `SET OFFSETX/OFFSETY`-Nachkorrektur |
 | `pos_res_um` | int (0.001 mm) | Rest-Fehler der gewählten Stufe-1-Dreier-Kombination gegen die nicht beteiligten Mikrofone - Maß für Konsistenz der Rohmessung (siehe 7.3), **unbeeinflusst** von `OFFSETX/OFFSETY` |
@@ -299,6 +302,40 @@ clean = pos_valid
         AND precision_um <= max_precision_um    (SET MAXPRECISION, Default 2000)
         AND (use_piezo == 0 OR piezo_ok == 1)
 ```
+
+#### 4.5b `shot` / `reject` bei `algo:"rim"` (seit Rev 4.11.0, `SET ALGO=RIM`)
+
+`SET ALGO=RIM` (Default weiterhin `CLASSIC`, siehe 5.2) ersetzt Trigger UND
+Positionslösung durch den in `schusserkennung-rev5.md` beschriebenen Ansatz
+(Ringpuffer-Erfassung + Piezo-Anker + robuste Ausgleichsrechnung mit
+Lochrand-Modell). Das Telegrammformat bleibt strukturell gleich (`type`,
+`seq`, `clean`, `hits`, `ts`, `synthetic`), einige Felder sind aber anders
+definiert oder entfallen/kommen neu hinzu:
+
+```json
+{"type":"shot","seq":44,"algo":"rim",
+ "air_ns":[[-820000,-819200],[-818300],[],[820,940],[-817100],[]],
+ "x_um":12480,"y_um":-3190,"sigma_x_um":410,"sigma_y_um":390,
+ "rms_ns":145,"t0_ns":-819180,"used_mask":47,"pos_valid":1,
+ "clean":1,"hits":5,"ts":123456}
+```
+
+| Feld | Typ | Bedeutung |
+|---|---|---|
+| `air_ns` | Array[6] von Arrays | wie bei `algo:"classic"`, aber die Zeiten sind relativ zum **Piezo** (nicht zur ersten Flanke) und können **negativ** sein (Ereignis vor dem Piezo, der Regelfall im `PAPER`-Modus); enthält alle innerhalb des Gate-Zeitfensters `[-PIEZOMAX, +postWait]` erfassten Kandidatenflanken, nicht nur die erste - der Löser wählt selbst die passende aus |
+| `x_um`,`y_um` | int (0.001 mm) | wie bei `algo:"classic"`, inkl. `SET OFFSETX/OFFSETY` |
+| `sigma_x_um`,`sigma_y_um` | int (0.001 mm) | **ersetzt `precision_um`/`cluster_hits`**: 1-Sigma-Unsicherheit aus der Kovarianzmatrix der Ausgleichsrechnung - der wahre Wert liegt mit ca. 68% Wahrscheinlichkeit innerhalb ±1σ, mit ca. 99% innerhalb ±2σ je Achse |
+| `rms_ns` | float | RMS der Zeit-Residuen der verwendeten Mikrofone (Diagnose, Gegenstück zu `pos_res_um`) |
+| `t0_ns` | float | geschätzter Einschlagzeitpunkt relativ zum Piezo (typisch negativ im `PAPER`-Modus, nahe 0 im `STEEL`-Modus) |
+| `used_mask` | uint (Bitmaske) | Bit `i` gesetzt = Mikrofon `i` ging in die finale Lösung ein (Inlier) |
+| `pos_res_um`,`precision_um`,`cluster_hits`,`piezo_ns`,`piezo_ok` | — | **entfallen bei `algo:"rim"`** (kein Feld im Telegramm) - das Piezo ist hier immer der Trigger selbst, eine gesonderte Verzögerungsprüfung entfällt |
+| `clean` | 0/1 | bei `algo:"rim"`: `pos_valid AND max(sigma_x_um,sigma_y_um) <= max_sigma_um` (`SET MAXSIGMA`, siehe 5.2) - **andere Formel** als bei `algo:"classic"` (dortige Formel bleibt unverändert gültig für `algo:"classic"`) |
+
+Ablaufreihenfolge unterscheidet sich ebenfalls: es gibt kein festes
+`SET WINDOW`, ausgewertet wird stattdessen, sobald nach dem Piezo-Anker eine
+von der Geometrie/Schallgeschwindigkeit abhängige Wartezeit verstrichen ist
+(nicht separat konfigurierbar). `PAPERTRIGGER=ANY` und `=PIEZO` verhalten
+sich bei `algo:"rim"` identisch (das Piezo triggert immer).
 
 #### `cand` — Kandidaten-Debug (nur `SET DEBUG=3`)
 
@@ -414,20 +451,23 @@ Werte case-sensitiv.
 | `PORT` | 1-65535 | 9000 | ✅ | TCP-Port des Stand-PC |
 | `LANE` | 1-999 | 1 | – | Bahnnummer |
 | `DEBOUNCE` | 10-5000 (ms) | 100 | – | Sperrzeit nach einer Auslösung |
-| `WINDOW` | 1-50 (ms) | 1 | – | Mindest-Sammelfenster (wird bei aktivem Piezo automatisch bis `PIEZOMAX+200µs` verlängert) |
+| `WINDOW` | 1-50 (ms) | 1 | – | Mindest-Sammelfenster (wird bei aktivem Piezo automatisch bis `PIEZOMAX+200µs` verlängert). Nur `ALGO=CLASSIC` - bei `ALGO=RIM` wirkungslos, siehe 4.5b |
 | `DEBUG` | 0-3 | 0 | – | 3 = zusätzliche `cand`/`*_pre`-Diagnosefelder; `shot`/`reject` selbst gehen immer raus |
-| `OUTLIER` | 0-500000 (0.001mm) | 5000 | – | Schwelle für `pos_res_um` in `clean`-Bewertung |
-| `RADIUS` | 0-500000 (0.001mm) | 200 | – | Umkreis für `cluster_hits` und Verifizierungs-Mittelpunkt |
-| `MINCLUSTER` | 0-20 | 2 | – | Mindest-`cluster_hits` für `clean` |
-| `MAXPRECISION` | 0-500000 (0.001mm) | 2000 | – | Max. `precision_um` für `clean` |
+| `OUTLIER` | 0-500000 (0.001mm) | 5000 | – | Schwelle für `pos_res_um` in `clean`-Bewertung (nur `ALGO=CLASSIC`) |
+| `RADIUS` | 0-500000 (0.001mm) | 200 | – | Umkreis für `cluster_hits` und Verifizierungs-Mittelpunkt (nur `ALGO=CLASSIC`) |
+| `MINCLUSTER` | 0-20 | 2 | – | Mindest-`cluster_hits` für `clean` (nur `ALGO=CLASSIC`) |
+| `MAXPRECISION` | 0-500000 (0.001mm) | 2000 | – | Max. `precision_um` für `clean` (nur `ALGO=CLASSIC`) |
 | `MINMICS` | 3-6 | 5 | – | Mindestzahl Mics, sonst `reject` |
-| `TDOA` | 100-5000 (µs) | 750 | – | Geometrie-Plausibilitätsfenster (ISR-Ebene) |
+| `TDOA` | 100-5000 (µs) | 750 | – | Geometrie-Plausibilitätsfenster (ISR-Ebene). Nur `ALGO=CLASSIC` - bei `ALGO=RIM` wirkungslos (Gate ergibt sich aus `PIEZOMIN/MAX`, siehe 4.5b) |
 | `TARGET` | `STEEL`\|`PAPER` | `STEEL` | – | Geometrie-Preset (siehe 7.2) |
 | `STANDOFFSTEEL` | 5.0-100.0 (mm) | 30.0 | – | Mic-Standoff im STEEL-Modus |
 | `STANDOFFPAPER` | 5.0-100.0 (mm) | 28.0 | – | Mic-Standoff im PAPER-Modus |
 | `MICHALFX` | 5.0-300.0 (mm) | 115.0 | – | horizontaler Mic-Abstand zur Mittellinie |
-| `BSHIFTPCT` | 0-100 (%) | 50 | – | Kugeldurchmesser-Korrektur, 0=aus |
-| `BSHIFTCAP` | 0.0-20.0 (mm) | 3.0 | – | Kappung der Korrektur je Mikrofon |
+| `BSHIFTPCT` | 0-100 (%) | 50 | – | Kugeldurchmesser-Korrektur, 0=aus (nur `ALGO=CLASSIC`) |
+| `BSHIFTCAP` | 0.0-20.0 (mm) | 3.0 | – | Kappung der Korrektur je Mikrofon (nur `ALGO=CLASSIC`) |
+| `ALGO` | `CLASSIC`\|`RIM` | `CLASSIC` | – | **seit Rev 4.11.0**: Auswertepfad, siehe 4.5b/7.3b. `RIM` ignoriert `PIEZO=0` (Piezo ist dort immer der Trigger) |
+| `PELLETR` | 0.0-10.0 (mm) | 2.25 | – | Lochrand-Radius für `ALGO=RIM` (0=Punktquelle) |
+| `MAXSIGMA` | 0.0-50.0 (mm) | 2.0 | – | `clean`-Schwelle für `ALGO=RIM` (max. 1-Sigma-Unsicherheit) |
 | `PIEZO` | 0\|1 | 1 | – | Piezo als Trigger-Bestätigung nutzen |
 | `PIEZOMIN` | 0-5000 (µs) | 100 | – | nur PAPER-Modus relevant |
 | `PIEZOMAX` | 0-5000 (µs) | 1400 | – | Ausreißer-Obergrenze, beide Modi |
@@ -435,14 +475,14 @@ Werte case-sensitiv.
 | `TESTCOOLDOWN` | 0-10000 (ms) | 3000 | – | Mindestabstand ident. Meldungen im Testmodus |
 | `OFFSETX` | -50000..50000 (0.001mm) | 0 | – | konstanter Nachkorrektur-Offset x |
 | `OFFSETY` | -50000..50000 (0.001mm) | 0 | – | wie `OFFSETX`, y |
-| `SOUNDSPEED` | 300-400 (m/s) | 355 | – | **rein manuell**, wird von `CAL START` NICHT verändert |
+| `SOUNDSPEED` | 300-400 (m/s) | 343 | – | **rein manuell**, wird von `CAL START` NICHT verändert |
 | `PAPERFEED` | 10.0-100.0 (mm) | 50.0 | – | Vorschubstrecke je Auslösung |
 | `PAPERSPEED` | 0.5-30.0 (mm/s) | 5.0 | – | Geschwindigkeit 1. Hälfte, danach Abbremsrampe |
 | `PAPERAUTO` | 0\|1 | 1 | – | automatischen Vorschub überhaupt ausführen |
 | `PAPERTRIGGER` | `ANY`\|`PIEZO`\|`CLEAN` | `PIEZO` | – | wann automatisch vorgeschoben wird |
 | `PAPERDIR` | 0\|1 | 1 | – | Vorschub-Drehrichtung invertieren |
 | `PAPERJOGSPEED` | 1.0-100.0 (mm/s) | 75.0 | – | Geschwindigkeit manueller Dauerbetrieb (Kippschalter) |
-| `CALSHOTS` | 3-20 | 5 | – | Anzahl Kalibrier-Schüsse für `CAL START` |
+| `CALSHOTS` | 3-20 | 10 | – | Anzahl Kalibrier-Schüsse für `CAL START` |
 | `OFS0`..`OFS5` | -20000..20000 (ns) | 0 | – | Timing-Offset je Mikrofonkanal (normalerweise durch `CAL START` gesetzt) |
 | `MICEN0`..`MICEN5` | 0\|1 | 1 | – | Mikrofonkanal für Auswertung UND Kalibrierung berücksichtigen |
 | `STATIC` | 0\|1 | 0 | ✅ | statische IP an/aus |
@@ -475,7 +515,7 @@ Ablaufdiagramm siehe Abschnitt 7.6 sowie die Befehle `NET CONFIRM`/
 | `CAL START` | startet Sammlung von `SET CALSHOTS` verwertbaren Schüssen; läuft parallel zum Normalbetrieb (jede Auslösung erzeugt weiterhin auch `shot`/`reject`); Ergebnis siehe `cal`/`"done"` (4.6) |
 | `CAL ABORT` | bricht ab, Offsets bleiben unverändert |
 | `CAL STATUS` | liefert aktuellen Fortschritt, ohne den Ablauf zu beeinflussen |
-| `CAL RESET` | setzt alle `OFS0..OFS5` auf 0 und `SOUNDSPEED` auf 355 zurück (persistiert), Antwort `{"type":"ok","cmd":"cal_reset"}` |
+| `CAL RESET` | setzt alle `OFS0..OFS5` auf 0 und `SOUNDSPEED` auf 343 zurück (persistiert), Antwort `{"type":"ok","cmd":"cal_reset"}` |
 | `CAL IMPORT OFS0=<ns>,...,OFS5=<ns>,SOUNDSPEED=<mps>` | **seit Rev 4.9.0**: atomarer Bulk-Restore einer vom Stand-PC gespeicherten Kalibrierung (siehe 4.6/7.1) - alle Werte zuerst validieren, **erst danach** schreiben, kein Teilzustand bei Abbruch mitten in der Übertragung. Kommagetrennte `KEY=WERT`-Paare, Reihenfolge beliebig, nicht alle Keys müssen vorkommen (nur die angegebenen werden geändert). Gültige Keys: `OFS0`..`OFS5` (-20000..20000 ns) und `SOUNDSPEED` (300-400 m/s) - identische Wertebereiche wie bei den einzelnen `SET`-Befehlen. Antwort `{"type":"ok","cmd":"cal_import"}` oder `{"type":"error","msg":"cal import: bad key=value (...)"}` bei irgendeinem ungültigen Paar (dann wurde **nichts** geschrieben). |
 
 Ablauf im Detail siehe Abschnitt 7.4.
@@ -648,11 +688,12 @@ separate `piezo_ns`/`piezo_ok`-Felder.
   Modi identisch.
 - Die Position wird per **TDOA-Hyperbel-Trilateration** aus den ersten
   Flankenzeiten von mindestens 3 Mikrofonen berechnet, mit einer
-  angenommenen Schallgeschwindigkeit `SET SOUNDSPEED` (Default 355 m/s -
-  bewusst höher als die physikalischen ~343 m/s bei 20°C, empirisch
-  ermittelt).
+  angenommenen Schallgeschwindigkeit `SET SOUNDSPEED` (Default 343 m/s,
+  klassischer Wert bei 20°C).
 
 ### 7.3 Auswertungs-Pipeline je Auslösung (Kurzfassung)
+
+Gilt für `SET ALGO=CLASSIC` (Default). Für `SET ALGO=RIM` siehe 7.3b.
 
 1. Für jede lösbare **Dreier-Kombination** erfasster Mikrofone wird eine
    Kandidatenposition berechnet (TDOA, quadratische Gleichung).
@@ -674,14 +715,48 @@ separate `piezo_ns`/`piezo_ok`-Felder.
 6. `SET DEBUG=3` macht zusätzlich die Stufe-1-Rohwerte (`*_pre`-Felder) und
    jede einzelne Dreier-Kombination (`cand`-Zeilen) sichtbar.
 
+### 7.3b Auswertungs-Pipeline bei `SET ALGO=RIM` (seit Rev 4.11.0)
+
+Siehe `schusserkennung-rev5.md` für die vollständige Herleitung; Kurzfassung:
+
+1. **Ringpuffer statt Sammelfenster:** jede Luft-Mic-Flanke wird laufend in
+   einem Ringpuffer je Kanal aufgezeichnet, unabhängig von Sperrzeit/
+   Fenster-Zustand - geht dadurch bei einem Mündungsknall-Fehlausloeser (bei
+   10m ~38ms vor dem Einschlag) nicht mehr verloren.
+2. **Piezo als alleiniger Trigger:** nur eine Piezo-Flanke startet die
+   Auswertung ("Anker", `t=0`). Ausgewertet wird rückwirkend: der Einschlag
+   muss in `[-PIEZOMAX, -PIEZOMIN]` (PAPER) bzw. `[-PIEZOMAX, 0]` (STEEL)
+   relativ zum Anker liegen ("Gate") - Mündungsknall, Echos und Störflanken
+   fallen dadurch automatisch heraus.
+3. **MSAC-Hypothesen:** jede Mic-Dreierkombination × Kandidatenflanken wird
+   geschlossen gelöst und nach Konsens der übrigen Mikrofone bewertet - ein
+   einzelnes Echo kann so nicht mehr "gewinnen".
+4. **Robuste Ausgleichsrechnung** (Gauss-Newton, Huber-Gewichte) über alle
+   Inlier-Mikrofone gleichzeitig, inkl. **Lochrand-Modell** (`SET PELLETR`):
+   der erste Schall kommt vom Randpunkt, der dem jeweiligen Mikrofon am
+   nächsten liegt, nicht vom Lochmittelpunkt.
+5. **Güte:** `sigma_x_um`/`sigma_y_um` aus der Kovarianzmatrix statt
+   `precision_um`/`cluster_hits`; `clean` nutzt `SET MAXSIGMA` statt
+   `MAXPRECISION`/`RADIUS`/`MINCLUSTER` (die drei bleiben nur für
+   `ALGO=CLASSIC` wirksam).
+
 ### 7.4 Kalibrierungsablauf (`CAL START`)
+
+Läuft in **beiden** Auswertepfaden (`SET ALGO`) gleich ab und kalibriert
+jeweils den Pfad, der zum Zeitpunkt von `CAL START` aktiv ist (bei `ALGO=RIM`
+wird intern die RMS-Residuen-Summe der Ausgleichsrechnung statt der
+`pos_res_um`-Summe minimiert - Ergebnis sind in beiden Fällen dieselben
+`OFS0..OFS5`-Mikrofon-Timing-Offsets).
 
 1. `CAL START` → `cal`/`"start"`. Sammlung beginnt **parallel** zum
    Normalbetrieb (jede Auslösung erzeugt weiterhin normal `shot`/`reject`).
 2. Jede Auslösung mit **≥3 Mikrofonen und** (falls `SET PIEZO=1`) einer
    plausiblen Piezo-Bestätigung zählt als Kalibrier-Schuss → `cal`/`"waiting"`
    mit Fortschritt. Andere Auslösungen während der Sammlung → `cal`/`"skipped"`.
-3. Nach `SET CALSHOTS` (Default 5) gesammelten Schüssen: automatische
+   Bei `ALGO=RIM` genügt **≥3 Mikrofone innerhalb des Gate-Zeitfensters** -
+   eine gesonderte Piezo-Bestätigung entfällt (das Piezo ist dort immer der
+   Trigger selbst).
+3. Nach `SET CALSHOTS` (Default 10) gesammelten Schüssen: automatische
    Optimierung per Koordinatenabstieg (11 Runden, Schrittweite halbiert sich
    je Runde, Referenzmikrofon 0 bleibt fix bei Offset 0 - Kalibrierungsfreiheitsgrad),
    minimiert die Summe der Rest-Fehler (`pos_res_um`-Äquivalent) über alle
@@ -777,8 +852,11 @@ das ist beabsichtigt, kein Fehlerzustand.
 
 `TESTSHOOT` erzeugt keinen separaten Telegrammtyp, sondern speist synthetische
 Werte GENAU in die Puffer ein, die sonst die Mikrofon-/Piezo-Interrupts
-füllen (`airCC`/`airCount`/`firstAirCC`/`firstHitTimeUs`/`piezoCC`/
-`piezoSeen`) - der komplette weitere Ablauf (Fensterlogik, `processShot()`,
+füllen - bei `ALGO=CLASSIC` (`airCC`/`airCount`/`firstAirCC`/`firstHitTimeUs`/
+`piezoCC`/`piezoSeen`), bei `ALGO=RIM` (seit Rev 4.11.0) analog in die
+Ringpuffer (`ringCC`/`ringUs`) plus einen synthetischen Piezo-Anker
+(`piezoAnchorCC`/`piezoAnchorUs`/`piezoPending`) - der komplette weitere
+Ablauf (Fenster-/Anker-Logik, `processShot()`/`processShotAnchored()`,
 automatischer Papiervorschub, `clean`-Bewertung) läuft danach **exakt so wie
 bei einem echten Schuss**, ohne jede Sonderbehandlung im Auswertungscode.
 Einzige Ausnahme: die Kalibrierungs-Sammlung (`CAL START`) wird bewusst

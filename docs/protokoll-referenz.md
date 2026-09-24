@@ -21,7 +21,7 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
 - Rev 4.9.1 hat zusätzlich `TESTSHOOT [<z_mm>]` ergänzt - ein synthetischer
   Testschuss (zufällige Position, plausible Rohdaten nach aktueller
   Kalibrierung) zum Prüfen der Kommunikationsstrecke ohne echte Sensorik,
-  siehe 5.8 und 7.7.
+  siehe 5.7 und 7.7.
 
 ---
 
@@ -138,7 +138,7 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
    sonst nach 10 s aus, danach (falls WLAN selbst noch steht) ein
    1 s-Diagnoseblinken nach weiteren 1 s Wartezeit. Kein Telegramm begleitet
    diese automatischen Zustandswechsel - rein visuell vor Ort. Seit Rev 4.9.0
-   per `ACTION LIGHT=ON|OFF` fernsteuerbar (siehe 5.6) - das pausiert die
+   per `ACTION LIGHT=ON|OFF` fernsteuerbar (siehe 5.5) - das pausiert die
    automatische Anzeige komplett, bis `ACTION LIGHT=AUTO` sie wieder
    freigibt (nicht persistent, nach Reboot immer wieder `AUTO`).
 
@@ -194,8 +194,8 @@ Gesendet: auf `SHOW`-Befehl, und automatisch am Ende von `CAL START`
  "outlier_um":5000,"cluster_radius_um":200,"min_cluster_hits":2,
  "max_precision_um":2000,"min_mics":5,"tdoa_us":750,
  "mic_offset_ns":[0,0,0,0,0,0],"mic_enabled":[1,1,1,1,1,1],"cal_shots":10,
- "target":"steel","standoff_steel_mm":30.00,"standoff_paper_mm":28.00,
- "mic_half_x_mm":115.00,"bullet_shift_pct":50,"bullet_shift_cap_mm":3.00,
+ "standoff_paper_mm":28.00,
+ "mic_half_x_mm":115.00,"bullet_shift_pct":40,"bullet_shift_cap_mm":3.00,
  "algo":"classic","pellet_r_mm":2.25,"max_sigma_um":2000,
  "use_piezo":1,"piezo_min_us":100,"piezo_max_us":1400,
  "test_cooldown_ms":3000,"offset_x_um":0,"offset_y_um":0,"sound_mps":343,
@@ -206,7 +206,11 @@ Gesendet: auf `SHOW`-Befehl, und automatisch am Ende von `CAL START`
 Feldbedeutung deckungsgleich mit den `SET`-Parametern in Abschnitt 5 (gleicher
 Name, siehe dortige Tabelle für Bereich/Default/Einheit). `mic_offset_ns`/
 `mic_enabled` sind Arrays der Länge 6, Index = Mikrofonkanal (siehe 7.1).
-`mac` wie bei `status` (4.2).
+`mac` wie bei `status` (4.2). Das Feld `target` (bis Rev 4.11.0: `"steel"`
+oder `"paper"`) ist **seit Rev 4.11.1 entfallen** - es gibt nur noch den
+Papier-Messmodus (siehe 7.2). `tools/replay_shot.py`/`calibrate_mics.py`
+nehmen ohne dieses Feld `paper` an; `--target steel` bleibt zum Nachrechnen
+älterer Logs aus der Zeit vor Rev 4.11.1 nutzbar.
 
 ### 4.4 `confignet` — Netzwerkkonfiguration + Live-Verbindungsstatus
 
@@ -263,7 +267,7 @@ Stand-PC-Seite):
 | `reason` | string | bei `algo:"classic"` immer `"only <n> mic(s)"`; bei `algo:"rim"` zusätzlich möglich: `"fit failed"` (Gate/Ausgleichsrechnung ohne Lösung trotz genug Mikrofonen) |
 | `hits` | int | Anzahl Mikrofone, die ausgelöst haben (nach `SET MICEN<i>`-Maskierung) |
 | `piezo_ns` | int oder `null` | nur vorhanden, wenn `SET PIEZO=1`: Verzögerung des Piezo-Signals relativ zum ersten Luftschall-Ereignis in ns, oder `null` falls Piezo nicht ausgelöst hat. **Feld fehlt komplett**, wenn `SET PIEZO=0`. |
-| `synthetic` | 1, sonst fehlt das Feld | **nur bei `TESTSHOOT`** (seit Rev 4.9.1, siehe 5.8/7.7): markiert einen synthetischen Testschuss - bei echten Auslösungen fehlt dieses Feld komplett |
+| `synthetic` | 1, sonst fehlt das Feld | **nur bei `TESTSHOOT`** (seit Rev 4.9.1, siehe 5.7/7.7): markiert einen synthetischen Testschuss - bei echten Auslösungen fehlt dieses Feld komplett |
 
 #### `shot`
 
@@ -288,11 +292,11 @@ Stand-PC-Seite):
 | `cluster_hits` | int | Anzahl Kandidatenlösungen innerhalb `SET RADIUS` um die finale Position |
 | `pos_valid` | 0/1 | ob überhaupt eine geometrische Lösung gefunden wurde (bei ≥3 Mics fast immer 1) |
 | `piezo_ns` | int oder `null` | wie bei `reject`, nur wenn `SET PIEZO=1` |
-| `piezo_ok` | 0/1 | nur wenn `SET PIEZO=1`: ob die Piezo-Verzögerung im erwarteten Fenster (`PIEZOMIN`..`PIEZOMAX`, `PIEZOMIN` gilt nur im `PAPER`-Modus) lag |
+| `piezo_ok` | 0/1 | nur wenn `SET PIEZO=1`: ob die Piezo-Verzögerung im erwarteten Fenster (`PIEZOMIN`..`PIEZOMAX`) lag |
 | `clean` | 0/1 | **zusammenfassendes Gütekriterium**, siehe Formel unten - der Stand-PC kann sich hierauf verlassen, statt die Schwellenlogik selbst nachzubilden |
 | `hits` | int | Anzahl auslösender Mikrofone (identisch zur Definition bei `reject`) |
 | `ts` | uint64 (ms) | Zeitstempel des ersten Ereignisses dieser Auslösung, **Millisekunden seit Geräte-Boot** (`esp_timer`), **keine Wanduhrzeit/Unixzeit** - für eine absolute Zeit muss der Stand-PC selbst beim Empfang der Zeile die eigene Uhrzeit anhängen |
-| `synthetic` | wie bei `reject` | **nur bei `TESTSHOOT`** (5.8/7.7) |
+| `synthetic` | wie bei `reject` | **nur bei `TESTSHOOT`** (5.7/7.7) |
 
 **`clean`-Formel** (alle Bedingungen müssen erfüllt sein):
 ```
@@ -322,11 +326,11 @@ definiert oder entfallen/kommen neu hinzu:
 
 | Feld | Typ | Bedeutung |
 |---|---|---|
-| `air_ns` | Array[6] von Arrays | wie bei `algo:"classic"`, aber die Zeiten sind relativ zum **Piezo** (nicht zur ersten Flanke) und können **negativ** sein (Ereignis vor dem Piezo, der Regelfall im `PAPER`-Modus); enthält alle innerhalb des Gate-Zeitfensters `[-PIEZOMAX, +postWait]` erfassten Kandidatenflanken, nicht nur die erste - der Löser wählt selbst die passende aus |
+| `air_ns` | Array[6] von Arrays | wie bei `algo:"classic"`, aber die Zeiten sind relativ zum **Piezo** (nicht zur ersten Flanke) und können **negativ** sein (Ereignis vor dem Piezo, der Regelfall); enthält alle innerhalb des Gate-Zeitfensters `[-PIEZOMAX, +postWait]` erfassten Kandidatenflanken, nicht nur die erste - der Löser wählt selbst die passende aus |
 | `x_um`,`y_um` | int (0.001 mm) | wie bei `algo:"classic"`, inkl. `SET OFFSETX/OFFSETY` |
 | `sigma_x_um`,`sigma_y_um` | int (0.001 mm) | **ersetzt `precision_um`/`cluster_hits`**: 1-Sigma-Unsicherheit aus der Kovarianzmatrix der Ausgleichsrechnung - der wahre Wert liegt mit ca. 68% Wahrscheinlichkeit innerhalb ±1σ, mit ca. 99% innerhalb ±2σ je Achse |
 | `rms_ns` | float | RMS der Zeit-Residuen der verwendeten Mikrofone (Diagnose, Gegenstück zu `pos_res_um`) |
-| `t0_ns` | float | geschätzter Einschlagzeitpunkt relativ zum Piezo (typisch negativ im `PAPER`-Modus, nahe 0 im `STEEL`-Modus) |
+| `t0_ns` | float | geschätzter Einschlagzeitpunkt relativ zum Piezo (typisch negativ - das Piezo löst planmäßig nach dem Einschlag aus) |
 | `used_mask` | uint (Bitmaske) | Bit `i` gesetzt = Mikrofon `i` ging in die finale Lösung ein (Inlier) |
 | `pos_res_um`,`precision_um`,`cluster_hits`,`piezo_ns`,`piezo_ok` | — | **entfallen bei `algo:"rim"`** (kein Feld im Telegramm) - das Piezo ist hier immer der Trigger selbst, eine gesonderte Verzögerungsprüfung entfällt |
 | `clean` | 0/1 | bei `algo:"rim"`: `pos_valid AND max(sigma_x_um,sigma_y_um) <= max_sigma_um` (`SET MAXSIGMA`, siehe 5.2) - **andere Formel** als bei `algo:"classic"` (dortige Formel bleibt unverändert gültig für `algo:"classic"`) |
@@ -411,17 +415,6 @@ Antwort auf `PING`.
 {"type":"pong"}
 ```
 
-### 4.9 `pin` — Pin-Diagnose
-
-Antwort auf jeden `PIN`-Befehl (siehe 5.5), auch bei `PIN LIST` einmal pro
-erlaubtem Pin.
-
-```json
-{"type":"pin","gpio":21,"mode":"out","level":1}
-```
-
-`mode` ∈ `"unset"|"in"|"pullup"|"pulldown"|"out"`.
-
 ## 5. Befehle Stand-PC → ESP32 (Referenz)
 
 Alle Befehle sind einzeilige Texte (siehe Framing, Abschnitt 2). Antworten
@@ -459,18 +452,16 @@ Werte case-sensitiv.
 | `MAXPRECISION` | 0-500000 (0.001mm) | 2000 | – | Max. `precision_um` für `clean` (nur `ALGO=CLASSIC`) |
 | `MINMICS` | 3-6 | 5 | – | Mindestzahl Mics, sonst `reject` |
 | `TDOA` | 100-5000 (µs) | 750 | – | Geometrie-Plausibilitätsfenster (ISR-Ebene). Nur `ALGO=CLASSIC` - bei `ALGO=RIM` wirkungslos (Gate ergibt sich aus `PIEZOMIN/MAX`, siehe 4.5b) |
-| `TARGET` | `STEEL`\|`PAPER` | `STEEL` | – | Geometrie-Preset (siehe 7.2) |
-| `STANDOFFSTEEL` | 5.0-100.0 (mm) | 30.0 | – | Mic-Standoff im STEEL-Modus |
-| `STANDOFFPAPER` | 5.0-100.0 (mm) | 28.0 | – | Mic-Standoff im PAPER-Modus |
+| `STANDOFFPAPER` | 5.0-100.0 (mm) | 28.0 | – | Mic-Standoff (rechtwinklig zur Scheibe) |
 | `MICHALFX` | 5.0-300.0 (mm) | 115.0 | – | horizontaler Mic-Abstand zur Mittellinie |
-| `BSHIFTPCT` | 0-100 (%) | 50 | – | Kugeldurchmesser-Korrektur, 0=aus (nur `ALGO=CLASSIC`) |
+| `BSHIFTPCT` | 0-100 (%) | 40 | – | Kugeldurchmesser-Korrektur, 0=aus (nur `ALGO=CLASSIC`) - seit Rev 4.11.4 Teil der `CAL START`-Kostenfunktion, siehe 7.4 |
 | `BSHIFTCAP` | 0.0-20.0 (mm) | 3.0 | – | Kappung der Korrektur je Mikrofon (nur `ALGO=CLASSIC`) |
 | `ALGO` | `CLASSIC`\|`RIM` | `CLASSIC` | – | **seit Rev 4.11.0**: Auswertepfad, siehe 4.5b/7.3b. `RIM` ignoriert `PIEZO=0` (Piezo ist dort immer der Trigger) |
 | `PELLETR` | 0.0-10.0 (mm) | 2.25 | – | Lochrand-Radius für `ALGO=RIM` (0=Punktquelle) |
 | `MAXSIGMA` | 0.0-50.0 (mm) | 2.0 | – | `clean`-Schwelle für `ALGO=RIM` (max. 1-Sigma-Unsicherheit) |
 | `PIEZO` | 0\|1 | 1 | – | Piezo als Trigger-Bestätigung nutzen |
-| `PIEZOMIN` | 0-5000 (µs) | 100 | – | nur PAPER-Modus relevant |
-| `PIEZOMAX` | 0-5000 (µs) | 1400 | – | Ausreißer-Obergrenze, beide Modi |
+| `PIEZOMIN` | 0-5000 (µs) | 100 | – | Min. erwartete Piezo-Verzögerung nach dem ersten Luft-Ereignis |
+| `PIEZOMAX` | 0-5000 (µs) | 1400 | – | Max. erwartete Piezo-Verzögerung / Ausreißer-Obergrenze |
 | `TESTMODE` | 0\|1 | 0 | – (nicht persistent) | Sensor-Diagnosemodus, siehe Abschnitt 8 |
 | `TESTCOOLDOWN` | 0-10000 (ms) | 3000 | – | Mindestabstand ident. Meldungen im Testmodus |
 | `OFFSETX` | -50000..50000 (0.001mm) | 0 | – | konstanter Nachkorrektur-Offset x |
@@ -534,23 +525,7 @@ den Port kann damit auch die WLAN-Zugangsdaten des Geräts löschen. Der
 Stand-PC sollte diesen Befehl selbst nur nach expliziter Nutzerbestätigung
 senden.
 
-### 5.5 `PIN` — GPIO-Diagnose (nicht persistent)
-
-Nur für Hardware-/Verkabelungsfehlersuche gedacht, **nicht** für den
-Normalbetrieb relevant. Erlaubte Pins (Positivliste): `0, 2, 4, 15, 16, 17,
-18, 19, 21`. Pins 16-19/21 werden im Normalbetrieb vom Papiervorschub genutzt
-- ein `PIN`-Befehl überschreibt deren Zustand bis zum nächsten
-Schritt-Impuls/Schalterabfrage.
-
-| Befehl | Wirkung |
-|---|---|
-| `PIN <n> IN` | Eingang ohne Pull-Widerstand, liest sofort |
-| `PIN <n> PULLUP` / `PULLDOWN` | Eingang mit internem Pull, liest sofort |
-| `PIN <n> OUT=0` / `OUT=1` | Ausgang, setzt Pegel |
-| `PIN <n> READ` | liest im zuletzt gesetzten Modus (Fehler, falls noch kein Modus gesetzt) |
-| `PIN LIST` | gibt für alle erlaubten Pins je eine `pin`-Zeile aus |
-
-### 5.6 `ACTION` — kurzlebige Bedienbefehle (seit Rev 4.9.0)
+### 5.5 `ACTION` — kurzlebige Bedienbefehle (seit Rev 4.9.0)
 
 Bewusst getrennt von `SET`: `ACTION`-Befehle lösen ein Ereignis aus oder
 setzen einen **nicht persistenten** Laufzeit-Zustand, statt dauerhafte
@@ -564,10 +539,10 @@ Konfiguration zu ändern.
 | `ACTION TARGETCHANGE` | Scheibenwechsel/Papiervorschub - **identischer Codepfad wie `TESTSHOOTPAPER`** (5.4), nur unter einem für den produktiven Bedienfall sprechenden Namen: kein `shot`-Telegramm, kein Zähler-Inkrement, kein Abschluss-Telegramm (siehe 7.5) | `{"type":"ok","action":"targetchange"}` oder `{"type":"error","msg":"paper feed busy"}` |
 
 `ACTION LIGHT`-Zustand ist **nicht NVS-persistent** - nach jedem Reboot
-(auch nach `NET`-bedingtem Auto-Reboot, siehe 5.7) ist die Beleuchtung immer
+(auch nach `NET`-bedingtem Auto-Reboot, siehe 5.6) ist die Beleuchtung immer
 wieder im automatischen Modus.
 
-### 5.7 `NET` — Sicherheitsnetz für Netzwerk-Fernkonfiguration (seit Rev 4.9.0)
+### 5.6 `NET` — Sicherheitsnetz für Netzwerk-Fernkonfiguration (seit Rev 4.9.0)
 
 Siehe Abschnitt 7.6 für den vollständigen Ablauf. Kurzreferenz:
 
@@ -576,7 +551,7 @@ Siehe Abschnitt 7.6 für den vollständigen Ablauf. Kurzreferenz:
 | `NET STATUS` | zeigt den aktuellen Zustand: `{"type":"net","pending":false}`, oder `{"type":"net","pending":true,"reboot_required":true}` (Änderung gesetzt, aber noch nicht in diesen Wert gebootet), oder `{"type":"net","pending":true,"confirm_deadline_s":<n>}` (bereits mit den neuen Werten gebootet, Rücksprung-Watchdog zählt) |
 | `NET CONFIRM` | bestätigt die aktuell laufende Netzwerkkonfiguration endgültig, löscht den Rücksprungpunkt. **Nur möglich, wenn das Gerät bereits mit den neuen Werten läuft** (`confirm_deadline_s` sichtbar) - vor dem entsprechenden Reboot liefert es `{"type":"error","msg":"reboot required before confirming"}`, ohne anstehende Änderung `{"type":"error","msg":"no pending network change"}` |
 
-### 5.8 `TESTSHOOT [<z_mm>]` — synthetischer Testschuss (seit Rev 4.9.1)
+### 5.7 `TESTSHOOT [<z_mm>]` — synthetischer Testschuss (seit Rev 4.9.1)
 
 Erzeugt einen kompletten, plausiblen Schuss-Durchlauf **ohne echte Sensorik**,
 um die Kommunikationsstrecke zum Stand-PC Ende-zu-Ende zu prüfen. Ablauf und
@@ -661,31 +636,39 @@ jedem `shot`-Telegramm sowie Index bei `OFS<i>`/`MICEN<i>`):
 | 1 | 26 | rechts unten |
 | 2 | 27 | links oben |
 | 3 | 14 | rechts oben |
-| 4 | 32 | links mitte |
-| 5 | 33 | rechts mitte |
+| 4 | 4 | links mitte |
+| 5 | 13 | rechts mitte |
+
+Index 4/5 lagen bis Rev 4.11.2 auf GPIO32/33 - seit Rev 4.11.3 auf GPIO4/13
+umverkabelt, um den GPIO-Interrupt-Dispatch-Bias zwischen den beiden
+Hardware-Bänken (GPIO 0-31 vs. 32-39) zu vermeiden, der bei Treffern nahe
+der Scheibenmitte einen positionsabhängigen, nicht kalibrierbaren
+Zeitstempel-Fehler an genau diesen beiden Kanälen verursachte.
 
 Zusätzlich ein optionales Piezo-Kontaktmikrofon (GPIO34, Stahlplatte) als
 Trigger-Bestätigung (`SET PIEZO`) - kein eigener Index in `air_ns`, sondern
-separate `piezo_ns`/`piezo_ok`-Felder.
+separate `piezo_ns`/`piezo_ok`-Felder. GPIO34 bleibt in der "zweiten Bank",
+das ist unkritisch, da die Piezo-Verzögerung (`PIEZOMIN`..`PIEZOMAX`,
+≥100µs) weit außerhalb des ns-Bereichs dieses Effekts liegt.
 
 ### 7.2 Koordinatensystem
 
-- **Ursprung:** Mittelpunkt der Zielfläche (Stahlplatte oder Papierscheibe).
+- **Ursprung:** Mittelpunkt der Zielfläche (Papierscheibe).
 - **x:** nach rechts, **y:** nach oben, **z:** rechtwinklig von der Zielfläche
   weg Richtung Schütze - jeweils aus Schützensicht.
 - **Einheit in allen Telegrammen:** 0.001 mm (Mikrometer) als Ganzzahl
   (`x_um`, `y_um`, `pos_res_um`, `precision_um`, `offset_x_um`, `offset_y_um`
   usw.) - **nicht** Millimeter, trotz des `_um`-Suffix ist es tatsächlich
   Mikrometer (1000 = 1.0 mm).
-- Zwei Geometrie-Presets (`SET TARGET`):
-
-| | Mic-Y-Abstand zur Mitte | Mic-Standoff (Z) |
-|---|---|---|
-| `STEEL` (Default) | ±100 mm | `SET STANDOFFSTEEL` (Default 30 mm) |
-| `PAPER` | ±85 mm | `SET STANDOFFPAPER` (Default 28 mm) |
-
-  Horizontaler Mic-Abstand (`SET MICHALFX`, Default 115 mm) ist für beide
-  Modi identisch.
+- Geometrie: Mic-Y-Abstand zur Mitte fest ±85 mm, Mic-Standoff (Z) per
+  `SET STANDOFFPAPER` (Default 28 mm), horizontaler Mic-Abstand per
+  `SET MICHALFX` (Default 115 mm). **Bis Rev 4.11.0** gab es zusätzlich einen
+  `STEEL`-Modus (direkter Beschuss einer Stahlplatte ohne Papier, ±100 mm/
+  30 mm) - seit Rev 4.11.1 entfernt, da nicht mehr genutzt (siehe
+  Changelog in `schiessstand_firmware.ino`). Das Piezo (siehe 4.5b/7.3b)
+  sitzt weiterhin auf einer Stahlplatte **hinter** der Papierscheibe - das
+  ist reine Trigger-Hardware, kein Messmodus, und von der Entfernung nicht
+  betroffen.
 - Die Position wird per **TDOA-Hyperbel-Trilateration** aus den ersten
   Flankenzeiten von mindestens 3 Mikrofonen berechnet, mit einer
   angenommenen Schallgeschwindigkeit `SET SOUNDSPEED` (Default 343 m/s,
@@ -725,9 +708,8 @@ Siehe `schusserkennung-rev5.md` für die vollständige Herleitung; Kurzfassung:
    10m ~38ms vor dem Einschlag) nicht mehr verloren.
 2. **Piezo als alleiniger Trigger:** nur eine Piezo-Flanke startet die
    Auswertung ("Anker", `t=0`). Ausgewertet wird rückwirkend: der Einschlag
-   muss in `[-PIEZOMAX, -PIEZOMIN]` (PAPER) bzw. `[-PIEZOMAX, 0]` (STEEL)
-   relativ zum Anker liegen ("Gate") - Mündungsknall, Echos und Störflanken
-   fallen dadurch automatisch heraus.
+   muss in `[-PIEZOMAX, -PIEZOMIN]` relativ zum Anker liegen ("Gate") -
+   Mündungsknall, Echos und Störflanken fallen dadurch automatisch heraus.
 3. **MSAC-Hypothesen:** jede Mic-Dreierkombination × Kandidatenflanken wird
    geschlossen gelöst und nach Konsens der übrigen Mikrofone bewertet - ein
    einzelnes Echo kann so nicht mehr "gewinnen".
@@ -759,8 +741,11 @@ wird intern die RMS-Residuen-Summe der Ausgleichsrechnung statt der
 3. Nach `SET CALSHOTS` (Default 10) gesammelten Schüssen: automatische
    Optimierung per Koordinatenabstieg (11 Runden, Schrittweite halbiert sich
    je Runde, Referenzmikrofon 0 bleibt fix bei Offset 0 - Kalibrierungsfreiheitsgrad),
-   minimiert die Summe der Rest-Fehler (`pos_res_um`-Äquivalent) über alle
-   gesammelten Schüsse.
+   minimiert die Summe der Rest-Fehler über alle gesammelten Schüsse. Bei
+   `ALGO=CLASSIC` ist das seit Rev 4.11.4 der Rest-Fehler **nach** Anwendung
+   der Kugeldurchmesser-Korrektur (`SET BSHIFTPCT`/`BSHIFTCAP`), nicht mehr
+   der reine `pos_res_um`-Wert davor - vorher war `BSHIFTPCT`/`BSHIFTCAP` für
+   die Kalibrier-Suche komplett wirkungslos.
 4. Ergebnis wird **automatisch in NVS gespeichert** (`OFS0..OFS5`), `cal`/`"done"`
    gefolgt von einem vollen `config`-Telegramm.
 5. **`SOUNDSPEED` wird von diesem Vorgang nicht verändert** - trotz des
@@ -790,7 +775,7 @@ wird intern die RMS-Residuen-Summe der Ausgleichsrechnung statt der
 - **Manueller Dauerbetrieb** (Einfädeln) über zwei Kippschalter-GPIOs direkt
   am Gerät (`PAPER_SW_FWD_PIN`/`PAPER_SW_REV_PIN`) - **nicht** fernsteuerbar,
   rein lokale Hardware-Bedienung ohne jedes Telegramm.
-- **Seit Rev 4.9.0** gibt es mit `ACTION TARGETCHANGE` (5.6) einen für den
+- **Seit Rev 4.9.0** gibt es mit `ACTION TARGETCHANGE` (5.5) einen für den
   produktiven Bedienfall benannten Fernbefehl - technisch identisch zu
   `TESTSHOOTPAPER` (gleicher Codepfad, gleiche Einschränkungen: kein
   Abschluss-Telegramm, kein `shot`-Telegramm/Zähler, `"paper feed busy"` bei
@@ -861,7 +846,7 @@ automatischer Papiervorschub, `clean`-Bewertung) läuft danach **exakt so wie
 bei einem echten Schuss**, ohne jede Sonderbehandlung im Auswertungscode.
 Einzige Ausnahme: die Kalibrierungs-Sammlung (`CAL START`) wird bewusst
 **nicht** durchlaufen - `TESTSHOOT` wird abgelehnt, solange eine Kalibrierung
-aktiv ist (5.8), damit keine synthetischen, unrealistisch perfekten Werte in
+aktiv ist (5.7), damit keine synthetischen, unrealistisch perfekten Werte in
 eine echte Kalibrierung einfließen.
 
 **Herleitung je aktivem Mikrofonkanal** (`SET MICEN0..MICEN5`, deaktivierte
@@ -875,11 +860,9 @@ Kanäle bleiben wie bei einem echten Schuss unberücksichtigt):
    7.2 - identisch zu den Werten, die auch `solveAirPosition()` für echte
    Schüsse verwendet) und daraus die Schall-Laufzeit mit der aktuellen
    `SET SOUNDSPEED`.
-3. **STEEL-Modus:** Nullpunkt = Piezo (quasi-latenzfrei, wie bei einem
-   echten Treffer auf die Stahlplatte) - alle Mikrofon-Laufzeiten sind
-   Verzögerungen relativ dazu. **PAPER-Modus:** Nullpunkt = das am
-   schnellsten erreichte Mikrofon, der Piezo folgt mit einer Verzögerung in
-   der Mitte des erlaubten Fensters `SET PIEZOMIN`..`SET PIEZOMAX`.
+3. Nullpunkt = das am schnellsten erreichte Mikrofon, der Piezo folgt mit
+   einer Verzögerung in der Mitte des erlaubten Fensters `SET PIEZOMIN`..
+   `SET PIEZOMAX`.
 4. Die so berechnete (kalibrationsfreie) Laufzeit wird je Kanal um den
    aktuellen `SET OFS<i>`-Wert verschoben, bevor sie in `airCC[i][0]`
    geschrieben wird - denn `processShot()` zieht genau diesen Offset beim
@@ -893,7 +876,7 @@ Kanäle bleiben wie bei einem echten Schuss unberücksichtigt):
 5. Rundungen (Fließkomma-Nanosekunden → ganzzahlige CPU-Zyklen, siehe
    `cpuMHz`) sind die einzige Quelle einer (typischerweise verschwindend
    kleinen, deutlich unter 1 µm liegenden) Abweichung zwischen
-   `target_x_um`/`target_y_um` aus der `TESTSHOOT`-Bestätigung (5.8) und dem
+   `target_x_um`/`target_y_um` aus der `TESTSHOOT`-Bestätigung (5.7) und dem
    `x_um`/`y_um` im nachfolgenden `shot`-Telegramm.
 
 **Praktische Nutzung für die Stand-PC-Anbindung:** `TESTSHOOT` eignet sich,
@@ -984,7 +967,7 @@ ist **nicht NVS-persistent** - ein Reboot beendet ihn zuverlässig.
     Befehle - der TCP-Port bleibt weiterhin ohne jede Authentifizierung
     erreichbar (Punkt 6 oben gilt unverändert, `NET`/`ACTION`/`CAL IMPORT`
     eingeschlossen).
-13. **`TESTSHOOT` (5.8/7.7) erzeugt reguläre `shot`/`reject`-Telegramme** -
+13. **`TESTSHOOT` (5.7/7.7) erzeugt reguläre `shot`/`reject`-Telegramme** -
     ein Stand-PC, der jede Auslösung automatisch in eine Wertung übernimmt,
     **muss** auf das zusätzliche Feld `"synthetic":1` prüfen und solche
     Zeilen davon ausschließen (bei echten Schüssen fehlt das Feld komplett,

@@ -1,6 +1,112 @@
 /*
  * ============================================================================
  *  Elektronischer Schießstand – ESP32 Firmware
+ *  Rev 4.11.4 – calCostClassic()/solveAirPosition(): Die Kugeldurchmesser-
+ *              Korrektur (SET BSHIFTPCT/BSHIFTCAP) fliesst jetzt in die
+ *              Timing-Offset-Kalibrierung (CAL START) mit ein. Bisher
+ *              optimierte calCostClassic() gegen den Rest-Fehler VOR der
+ *              Korrektur - SET BSHIFTPCT/BSHIFTCAP war dadurch komplett
+ *              wirkungslos fuer die Kalibrier-Suche, egal welcher Wert
+ *              eingestellt war, kamen immer dieselben Mic-Offsets heraus.
+ *              solveAirPosition() liefert dafuer einen neuen optionalen
+ *              Ausgabewert outResidualCorrMm (derselbe Rest-Fehler wie
+ *              outResidualMm, aber MIT angewandter Korrektur, an der bereits
+ *              verschobenen Stufe-1-Position bestX/bestY neu berechnet) -
+ *              outResidualMm/pos_res_um bleiben unveraendert der reine
+ *              Vorher-Wert (fuer die Telegramm-Ausgabe/Diagnose unveraendert
+ *              relevant). Bewusst NICHT stattdessen precision_um (Kandidaten-
+ *              Clusterbreite) als Kostenmass verwendet, da das nur von den 2
+ *              naechstgelegenen Kandidaten abhaengt und die Suche dadurch
+ *              einen zufaellig eng geclusterten, aber falschen Punkt statt
+ *              der echten Kalibrierung finden koennte. Default SET BSHIFTPCT
+ *              (nur Fallback fuer ein nie konfiguriertes Geraet) von 50 auf
+ *              40 geaendert - mit der jetzt korrektur-bewussten Kalibrierung
+ *              hat sich 40% als besser erwiesen. Ursprung/Vorab-Test: Server-
+ *              seitiger Simulator (separates Projekt, server/simulator.go),
+ *              dort u.a. mit einem Regressionstest fuer die Wiederherstell-
+ *              barkeit eines einzelnen absichtlich verstellten Mikrofon-
+ *              Offsets nach der Umstellung geprueft. docs/protokoll-
+ *              referenz.md (5.2/7.4) entsprechend aktualisiert.
+ * ============================================================================
+ *
+ *  Rev 4.11.3 – Hardware-Umverkabelung: AIR_PINS[4]/[5] (Luft-Mic "links
+ *              mitte"/"rechts mitte") von GPIO32/33 auf GPIO4/13 verlegt.
+ *              Hintergrund (siehe Session-Historie zu Kanal 4 sowie
+ *              schusserkennung-rev5.md Abschnitt 4): der ESP32-GPIO-
+ *              Interrupt-Controller hat fuer die Pins 0-31 und 32-39 ZWEI
+ *              getrennte Status-Register - der gemeinsame ISR-Dispatcher
+ *              liest und verarbeitet IMMER zuerst vollstaendig alle
+ *              anstehenden Flanken aus Bank 0 (0-31), bevor er ueberhaupt
+ *              Bank 1 (32-39) abfragt. Lagen also z.B. AIR0-AIR3 (GPIO25/26/
+ *              27/14, alle Bank 0) und AIR4/AIR5 (bisher GPIO32/33, Bank 1)
+ *              bei einem Treffer nahe der Scheibenmitte (wo alle 6 Mics fast
+ *              gleichzeitig ausloesen) im selben Interrupt-Aufruf, bekamen
+ *              AIR4/AIR5 einen um die Bank-Umschaltung plus die komplette
+ *              Bearbeitung der Bank-0-Flanken zu SPAETEN Zeitstempel -
+ *              positionsabhaengig (am staerksten genau in der Scheibenmitte)
+ *              und damit NICHT per SET OFS4/OFS5 wegkalibrierbar, da der
+ *              Effekt nur auftritt, wenn UEBERHAUPT ein Bank-0-Mic im
+ *              selben Interrupt mitfeuert. Nach der Umverkabelung liegen
+ *              alle 6 Luft-Mics in Bank 0 - nur noch das Piezo (GPIO34)
+ *              bleibt in Bank 1, was unkritisch ist (SET PIEZOMIN..
+ *              PIEZOMAX, >=100us Verzoegerung, liegt weit ausserhalb dieses
+ *              ns-Effekts). GPIO4/13 bewusst statt z.B. GPIO0/2/12/15
+ *              gewaehlt: keine Strapping-Pins (GPIO12 waere z.B. die Flash-
+ *              Spannungs-Auswahl VDD_SDIO - ein bei Reset dauerhaft high
+ *              liegender Komparatorausgang koennte dort jeden Bootvorgang
+ *              verhindern), verhalten sich wie GPIO25/26/27/14 (normaler
+ *              interner Pull-Up, keine Sonderbehandlung wie bei GPIO34-39
+ *              noetig - siehe setup()). Reine Code-Aenderung ist AIR_PINS[]
+ *              (siehe dort); die Geometrie (MIC_X/MIC_Y, Index-basiert)
+ *              bleibt unberuehrt. Empfehlung nach dem Umstecken: CAL RESET
+ *              + neue CAL START-Serie, da die bisherigen OFS4/OFS5-Werte
+ *              ggf. einen Teil der jetzt entfallenen Bank-Verzoegerung mit
+ *              einkalibriert hatten. docs/protokoll-referenz.md (7.1)
+ *              entsprechend aktualisiert.
+ * ============================================================================
+ *
+ *  Rev 4.11.2 – Aufraeumen ungenutzter Funktionen (Fortsetzung von Rev
+ *              4.11.1): Messmodus TARGET_STEEL komplett entfernt - Papier
+ *              (Durchschlagmessung) ist jetzt die einzige, fest verdrahtete
+ *              Geometrie. Entfernt: cfg.targetMode, TARGET_STEEL/TARGET_PAPER,
+ *              SET TARGET, cfg.standoffSteelMm/SET STANDOFFSTEEL,
+ *              MIC_HALF_Y_STEEL/MIC_STANDOFF_STEEL, das "target"/
+ *              "standoff_steel_mm"-Feld im SHOW-Telegramm. applyTargetGeometry()
+ *              setzt MIC_Y[]/micStandoffMm jetzt unbedingt auf die (bisherige)
+ *              PAPER-Geometrie (SET STANDOFFPAPER bleibt unveraendert
+ *              konfigurierbar). WICHTIG - die Piezo-Trigger-Logik im
+ *              PAPER-Betrieb ist davon NICHT betroffen: alle Stellen, die
+ *              bisher auf "cfg.targetMode==TARGET_STEEL -> PIEZOMIN
+ *              ueberspringen bzw. Gate/Nullpunkt anders legen" verzweigten
+ *              (processShot()::piezoOk, calCostRim()/processShotAnchored()::
+ *              gate.t0MaxNs, handleTestShoot() fuer beide ALGO-Pfade), wurden
+ *              gezielt auf den bisherigen PAPER-Zweig festgeschrieben - SET
+ *              PIEZOMIN/PIEZOMAX/PIEZO verhalten sich fuer echte wie fuer
+ *              TESTSHOOT-Schuesse exakt wie zuvor im PAPER-Modus. Das Piezo
+ *              selbst sitzt weiterhin (unveraendert) als Koerperschall-
+ *              Trigger auf einer Stahlplatte HINTER der Papierscheibe -
+ *              das ist Trigger-Hardware, kein Messmodus, und bleibt
+ *              bestehen. tools/replay_shot.py: Default fuer ein fehlendes
+ *              "target"-Feld (altes Log ohne dieses Feld) von "steel" auf
+ *              "paper" umgestellt; "--target steel" bleibt zum Nachrechnen
+ *              aelterer Logs von vor dieser Revision nutzbar. docs/protokoll-
+ *              referenz.md entsprechend bereinigt (Abschnitt 7.2 etc.).
+ * ============================================================================
+ *
+ *  Rev 4.11.1 – Aufraeumen ungenutzter Funktionen (Beginn, siehe Wunsch nach
+ *              Reduzierung auf tatsaechlich genutzte Befehle): PIN-Diagnose
+ *              (Rev 4.8.5) komplett entfernt - Befehl PIN <n>/PIN LIST,
+ *              "pin"-Telegramm, PIN_DIAG_ALLOWED[]/PinDiagMode/pinDiagMode[]/
+ *              pinDiagAllowed()/pinDiagModeName()/pinDiagReport()/
+ *              handlePinCommand() sowie der zugehoerige HELP-Text. War nur
+ *              fuer die Hardware-/Verkabelungsfehlersuche gedacht (siehe
+ *              Session-Historie), nicht fuer den Normalbetrieb. Wirkt sich
+ *              NICHT auf die Pinbelegung selbst aus (AIR_PINS/PIEZO_PIN/
+ *              PAPER_*_PIN etc. unveraendert) - nur der Diagnose-BEFEHL
+ *              entfaellt. docs/protokoll-referenz.md entsprechend bereinigt
+ *              (Abschnitte 4.9/5.5 entfernt, nachfolgende umnummeriert).
+ * ============================================================================
+ *
  *  Rev 4.11.0 – NEU (optional, siehe SET ALGO): zweiter, per SET ALGO=
  *              CLASSIC|RIM umschaltbarer Auswertepfad ("RIM"), der
  *              schusserkennung-rev5.md umsetzt - Default bleibt CLASSIC
@@ -223,6 +329,7 @@
  *              dessen Modus/Pegel bis zum naechsten Schritt-Impuls bzw. zur
  *              naechsten Schalter-Abfrage - fuer gezielte Pin-Fehlersuche
  *              gewollt. Siehe handlePinCommand()/PIN_DIAG_ALLOWED[].
+ *              [Entfernt in Rev 4.11.1 - siehe dortigen Eintrag.]
  * ============================================================================
  *
  *  Rev 4.8.4 – Geschwindigkeit des manuellen Dauerbetriebs (Einfaedeln ueber
@@ -364,6 +471,8 @@
  *              30.0/28.0 - vorher MIC_STANDOFF_STEEL/MIC_STANDOFF_PAPER
  *              Compile-Konstanten). Wirkt sofort (applyTargetGeometry()),
  *              kein Reboot noetig, wird in SHOW mit ausgegeben.
+ *              [SET STANDOFFSTEEL in Rev 4.11.1 entfernt (mit TARGET_STEEL),
+ *              SET STANDOFFPAPER bleibt unveraendert.]
  * ============================================================================
  *
  *  Rev 4.5.1 – Zwei Aenderungen an CAL START:
@@ -553,15 +662,11 @@
  *  mindestens SET PIEZOMAX + Sicherheitsmarge verlaengert, damit das
  *  Piezo-Ereignis nicht verpasst wird (siehe loop()).
  *
- *  WICHTIG - TARGET=STEEL unterscheidet sich hier grundlegend von PAPER:
- *  Im STEEL-Modus IST die Stahlplatte die Trefferflaeche, das Piezo sitzt
- *  also direkt darauf und erkennt den Einschlag quasi latenzfrei per
- *  Kontaktschall - schneller als die Luftschall-Laufzeit zu JEDEM Mikrofon.
- *  Es loest daher nahe t=0 aus (oft sogar exakt 0, wenn es selbst das
- *  Sammelfenster oeffnet), statt wie im PAPER-Modus SPAETER als der erste
- *  Luft-Treffer. SET PIEZOMIN wird deshalb im STEEL-Modus NICHT geprueft
- *  (siehe processShot()), SET PIEZOMAX bleibt als Ausreisser-Obergrenze in
- *  beiden Modi aktiv.
+ *  [Bis Rev 4.11.0 gab es hier zusaetzlich einen per SET TARGET waehlbaren
+ *  STEEL-Modus (direkter Beschuss einer Stahlplatte ohne Papier, Piezo dort
+ *  quasi latenzfrei nahe t=0, PIEZOMIN nicht geprueft) - seit Rev 4.11.1
+ *  entfernt, da nicht mehr genutzt. Die obige Beschreibung (PIEZOMIN..
+ *  PIEZOMAX NACH dem ersten Luft-Ereignis) gilt jetzt immer.]
  * ============================================================================
  *
  *  Die Messung über das Stahlblech (Körperschall-Sensoren + MCPWM-Hardware-
@@ -621,14 +726,11 @@
  *
  *  Trefferposition (x_um/y_um, 1 Einheit = 0.001 mm) wird per Hyperbel-
  *  Trilateration aus den ersten Flanken der Mikrofone berechnet. Ursprung
- *  = Zentrum der Zielflaeche, x positiv nach RECHTS, y positiv nach OBEN
- *  (aus Schützensicht). Geometrie (siehe MIC_X/MIC_Y/applyTargetGeometry()
- *  unten) je Seitenwand (x = ±115 mm vom Zentrum, bei beiden Zielarten
- *  gleich), 3 Mikrofone auf Höhe Mitte/+/-Y, per SET TARGET umschaltbar
- *  (Default STEEL, kein Reboot noetig):
- *    STEEL (Stahlblech-Abprallflaeche): Y = ±100 mm, 30 mm Standoff
- *    PAPER (Papierscheibe, misst den Durchschlagpunkt statt des Abpralls,
- *      z.B. bei zu starker Streuung auf Metall): Y = ±85 mm, 28 mm Standoff
+ *  = Zentrum der Zielflaeche (Papierscheibe), x positiv nach RECHTS, y
+ *  positiv nach OBEN (aus Schützensicht). Geometrie (siehe MIC_X/MIC_Y/
+ *  applyTargetGeometry() unten): x = ±115 mm vom Zentrum je Seitenwand (SET
+ *  MICHALFX), 3 Mikrofone auf Höhe Mitte/+/-Y = ±85 mm, 28 mm Standoff (SET
+ *  STANDOFFPAPER).
  *
  *  pos_valid=0, falls < 3 Mics ausgewertet werden konnten oder die
  *  Geometrie entartet war (x_um/y_um/pos_res_um/precision_um/cluster_hits
@@ -759,7 +861,7 @@
 // Konstanten & Werks-Defaults (greifen nur bei leerem NVS)
 // ---------------------------------------------------------------------------
 
-#define FW_VERSION   "4.11.0"
+#define FW_VERSION   "4.11.4"
 #define SERIAL_BAUD  115200
 #define NVS_NS       "schiessstd"     // NVS-Namespace
 
@@ -789,9 +891,29 @@
 //              4=links mitte 5=rechts mitte  (siehe MIC_X/MIC_Y weiter unten)
 //
 // Diagnose-Test 3 (GPIO32->GPIO35, siehe Rev-4.4.8-Hinweis im Header-
-// Kommentar ganz oben) ist zurueckgebaut - Index 4 wieder auf GPIO32 (Tests
-// 1/2 waren bereits vorher zurueckgebaut, siehe Rev 4.4.7/4.4.9).
-static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 32, 33};
+// Kommentar ganz oben) ist zurueckgebaut - Index 4 war danach wieder auf
+// GPIO32 (Tests 1/2 waren bereits vorher zurueckgebaut, siehe Rev 4.4.7/
+// 4.4.9).
+//
+// Rev 4.11.3 – Index 4/5 (GPIO32/33) auf GPIO4/13 umverkabelt: GPIO32/33
+// liegen im ESP32-GPIO-Interrupt-Controller in einer ZWEITEN Bank
+// (GPIO 32-39), die der gemeinsame GPIO-ISR-Dispatcher immer ERST NACH
+// vollstaendiger Abarbeitung der ersten Bank (GPIO 0-31) ueberhaupt liest -
+// bei fast gleichzeitigen Flanken (Treffer nahe der Scheibenmitte, wo alle
+// Mics fast gleich weit entfernt sind) bekamen Index 4/5 dadurch einen um
+// die Bank-Umschaltung UND die Bearbeitung aller anstehenden Bank-0-Flanken
+// zu spaeten Zeitstempel - positionsabhaengig, nicht per SET OFS4/OFS5
+// wegkalibrierbar (siehe Session-Historie zu Kanal 4 oben). GPIO4/13 liegen
+// in derselben Bank wie alle anderen Mics (0-31) - nur noch das Piezo
+// (GPIO34) bleibt in der zweiten Bank, dessen Verzoegerung zu den Mics
+// (SET PIEZOMIN..PIEZOMAX, >=100us) liegt weit ausserhalb dieses ns-Effekts.
+// GPIO4/13 sind bewusst gewaehlt: keine Strapping-Pins (anders als z.B.
+// GPIO0/2/12/15), verhalten sich wie GPIO25/26/27/14 (normaler interner
+// Pull-Up, keine Sonderbehandlung wie bei GPIO34-39 noetig). Nach dieser
+// Umverkabelung CAL RESET + neue CAL START-Serie empfohlen, da die alten
+// OFS4/OFS5-Werte ggf. einen Teil der jetzt entfallenen Bank-Verzoegerung
+// mit einkalibriert hatten.
+static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 4, 13};
 
 // Optionales Piezo-Kontaktmikrofon (Koerperschall) auf der Stahlplatte,
 // dient als Trigger-Bestaetigung gegen verfrueh durch den Muendungsknall
@@ -888,12 +1010,6 @@ static const uint8_t AIR_PINS[NUM_AIR] = {25, 26, 27, 14, 32, 33};
 #define PAPER_TRIG_PIEZO  1    // nur wenn das Piezo ausgeloest hat (Default)
 #define PAPER_TRIG_CLEAN  2    // nur bei "clean"-Schuessen (alle Qualitaetsschwellen)
 
-// Messmodus (SET TARGET, siehe applyTargetGeometry() weiter unten): legt
-// fest, welches Geometrie-Preset (Mic-Y-Abstand/Standoff) verwendet wird -
-// Stahlblech (Abprallflaeche) oder Papierscheibe (Durchschlag).
-#define TARGET_STEEL  0
-#define TARGET_PAPER  1
-
 // Auswertepfad (SET ALGO, siehe Rev-4.11.0-Hinweis im Header-Kommentar ganz
 // oben sowie processShot()/processShotAnchored()): CLASSIC ist Default und
 // bisheriges Verhalten 1:1 unveraendert, RIM aktiviert Ringpuffer-Erfassung +
@@ -950,22 +1066,20 @@ struct DeviceConfig {
                             // aus Positionsloesung UND CAL START auszuschliessen
     uint8_t  calShotCount;  // Anzahl Kalibrier-Schuesse (SET CALSHOTS,
                             // 3-MAX_CAL_SHOTS, Default 10)
-    uint8_t  targetMode;    // TARGET_STEEL (Default) oder TARGET_PAPER,
-                            // siehe applyTargetGeometry() (SET TARGET)
-    float    standoffSteelMm; // Mic-Standoff (rechtwinklig zur Platte) in mm
-                            // im STEEL-Modus (SET STANDOFFSTEEL, Default 30.0)
-    float    standoffPaperMm; // Wie standoffSteelMm, fuer PAPER-Modus
+    float    standoffPaperMm; // Mic-Standoff (rechtwinklig zur Scheibe) in mm
                             // (SET STANDOFFPAPER, Default 28.0)
     float    micHalfXMm;   // Horizontaler Abstand Mic-Spalte<->Mittellinie in
-                            // mm, fuer STEEL UND PAPER gleich (SET MICHALFX,
-                            // Default 115.0) - deckt z.B. ab, dass die Membran
-                            // 1-2mm hinter der aeusseren Mic-Huelle liegt
+                            // mm (SET MICHALFX, Default 115.0) - deckt z.B. ab,
+                            // dass die Membran 1-2mm hinter der aeusseren
+                            // Mic-Huelle liegt
     uint8_t  bulletShiftPct; // Kugeldurchmesser-Korrektur (siehe
                             // solveAirPosition()): Gewichtung 0-100% des
                             // signierten Rest-Fehlers der Stufe-1-Loesung
                             // gegen die daran nicht beteiligten Mikrofone,
                             // als Verschiebung Richtung/weg vom jeweiligen
-                            // Mikrofon (SET BSHIFTPCT, Default 50, 0=aus)
+                            // Mikrofon (SET BSHIFTPCT, Default 40, 0=aus) -
+                            // fliesst seit Rev 4.11.4 auch in CAL START mit
+                            // ein, siehe calCostClassic()
     float    bulletShiftCapMm; // Kappung der Kugeldurchmesser-Korrektur je
                             // Mikrofon in mm (SET BSHIFTCAP, Default 3.0)
     uint8_t  algoMode;      // ALGO_CLASSIC (Default) oder ALGO_RIM (SET ALGO,
@@ -983,11 +1097,11 @@ struct DeviceConfig {
     bool     usePiezo;      // Piezo (Stahlplatte, PIEZO_PIN) als Trigger-
                             // Bestaetigung nutzen? (SET PIEZO, Default 1/an)
     uint32_t piezoMinUs;    // Erwartete min. Verzoegerung Piezo nach erstem
-                            // Luftschall-Ereignis in us (SET PIEZOMIN, Default 100)
-                            // - gilt NUR im TARGET=PAPER-Modus, siehe processShot()
+                            // Luftschall-Ereignis in us (SET PIEZOMIN, Default 100),
+                            // siehe processShot()
     uint32_t piezoMaxUs;    // Erwartete max. Verzoegerung Piezo nach erstem
                             // Luftschall-Ereignis in us (SET PIEZOMAX, Default 1400)
-                            // - Ausreisser-Obergrenze fuer STEEL UND PAPER
+                            // - Ausreisser-Obergrenze
     uint32_t testCooldownMs; // Min. Abstand zwischen 2 Meldungen desselben
                             // Sensors im Testmodus, in ms (SET TESTCOOLDOWN,
                             // Default 3000) - siehe testModeHit()
@@ -1073,14 +1187,17 @@ static void loadConfig()
         cfg.micEnabled[i] = prefs.getBool(key, true);
     }
     cfg.calShotCount = prefs.getUChar("cal_n", 10);
-    cfg.targetMode = prefs.getUChar("target", TARGET_STEEL);
-    cfg.standoffSteelMm = prefs.getFloat("standoff_st", 30.0f);
     cfg.standoffPaperMm = prefs.getFloat("standoff_pa", 28.0f);
     // Literal statt MIC_HALF_X-Makro: das Makro ist erst weiter unten im
-    // File definiert (siehe dortigen Kommentar zu STANDOFFSTEEL/-PAPER, wo
+    // File definiert (siehe dortigen Kommentar zu STANDOFFPAPER, wo
     // derselbe Reihenfolge-Fallstrick schon einmal aufgetreten ist).
     cfg.micHalfXMm = prefs.getFloat("mic_half_x", 115.0f);
-    cfg.bulletShiftPct = prefs.getUChar("bshift_pct", 50);
+    // Default 40 (statt bisher 50): seit calCostClassic() die Kugeldurchmesser-
+    // Korrektur mit einbezieht (siehe dortigen Kommentar), hat sich in
+    // Simulator-Tests 40% als bester Wert erwiesen. Gilt nur als Fallback fuer
+    // ein frisch geflashtes/nie konfiguriertes Geraet - ein bereits per SET
+    // BSHIFTPCT konfiguriertes Geraet behaelt seinen eingestellten Wert.
+    cfg.bulletShiftPct = prefs.getUChar("bshift_pct", 40);
     cfg.bulletShiftCapMm = prefs.getFloat("bshift_cap", 3.0f);
     cfg.algoMode   = prefs.getUChar("algo", ALGO_CLASSIC);
     cfg.pelletRadiusMm = prefs.getFloat("pellet_r", 2.25f);
@@ -1368,11 +1485,9 @@ static bool     testSeparatorShown = false; // nur 1x Trennlinie je Stille-Perio
 static uint64_t testSeriesStartUs  = 0;   // Zeitpunkt des 1. Sensors nach der
                                            // letzten Trennlinie (fuer +ms-Anzeige)
 static bool     testSeriesActive   = false;
-// AIR0/AIR5-Namen an den Diagnose-Verkabelungstausch angepasst (siehe
-// Kommentar bei MIC_X/applyTargetGeometry()) - Kanal 0 (GPIO25) traegt jetzt
-// das LM339-Signal, das geometrisch zu rechts-mitte gehoert, Kanal 5
-// (GPIO33) das zu links-unten gehoerende. AIR2/AIR4 sind wieder normal
-// (voriger Diagnosetausch dort zurueckgebaut).
+// Alle frueheren Hardware-Diagnose-Verkabelungstausche (Rev 4.4.6-4.4.9,
+// 4.8.1, siehe Header-Kommentar ganz oben) sind zurueckgebaut - Namen
+// entsprechen wieder 1:1 der Normalverkabelung (AIR_PINS[]/MIC_X/MIC_Y).
 static const char *TEST_SENSOR_NAMES[NUM_AIR + 1] = {
     "AIR0 links-unten", "AIR1 rechts-unten", "AIR2 links-oben",
     "AIR3 rechts-oben",  "AIR4 links-mitte",  "AIR5 rechts-mitte",
@@ -1696,7 +1811,7 @@ static void sendShowConfig()
           "\"outlier_um\":%u,\"cluster_radius_um\":%u,\"min_cluster_hits\":%d,"
           "\"max_precision_um\":%u,\"min_mics\":%d,"
           "\"tdoa_us\":%u,\"mic_offset_ns\":[%s],\"mic_enabled\":[%s],\"cal_shots\":%d,"
-          "\"target\":\"%s\",\"standoff_steel_mm\":%.2f,\"standoff_paper_mm\":%.2f,"
+          "\"standoff_paper_mm\":%.2f,"
           "\"mic_half_x_mm\":%.2f,"
           "\"bullet_shift_pct\":%d,\"bullet_shift_cap_mm\":%.2f,"
           "\"algo\":\"%s\",\"pellet_r_mm\":%.2f,\"max_sigma_um\":%ld,"
@@ -1711,8 +1826,7 @@ static void sendShowConfig()
           cfg.airOutlierUm, cfg.clusterRadiusUm, cfg.minClusterHits,
           cfg.maxPrecisionUm, cfg.minMics,
           cfg.airMaxTdoaUs, ofsBuf, enBuf, cfg.calShotCount,
-          cfg.targetMode == TARGET_PAPER ? "paper" : "steel",
-          cfg.standoffSteelMm, cfg.standoffPaperMm,
+          cfg.standoffPaperMm,
           cfg.micHalfXMm,
           cfg.bulletShiftPct, cfg.bulletShiftCapMm,
           cfg.algoMode == ALGO_RIM ? "rim" : "classic",
@@ -2020,30 +2134,25 @@ static void servicePaperStepper()
 // ---------------------------------------------------------------------------
 // Positionsberechnung fuer die Luftschall-Messung
 // ---------------------------------------------------------------------------
-// Lokales Koordinatensystem der Abprallflaeche: Ursprung = Plattenzentrum,
+// Lokales Koordinatensystem der Zielflaeche: Ursprung = Scheibenzentrum,
 // x nach rechts, y nach oben (aus Schuetzensicht), z senkrecht von der
-// Platte weg Richtung Schuetze. Mic-Reihenfolge identisch zu AIR_PINS[]:
+// Scheibe weg Richtung Schuetze. Mic-Reihenfolge identisch zu AIR_PINS[]:
 //   0 = GPIO25 = links unten     1 = GPIO26 = rechts unten
 //   2 = GPIO27 = links oben      3 = GPIO14 = rechts oben
-//   4 = GPIO32 = links mitte     5 = GPIO33 = rechts mitte
-// Diagnose-Test 3 (GPIO32->GPIO35) ist zurueckgebaut, die Tests 1
-// (Mikrofon-Tausch GPIO27/32) und 2 (GPIO25<->GPIO33-Tausch) waren bereits
-// vorher zurueckgebaut - alle drei Hardware-Diagnosetests sind damit
-// abgeschlossen/normal.
+//   4 = GPIO4  = links mitte     5 = GPIO13 = rechts mitte
+// Alle frueheren Hardware-Diagnosetests (Rev 4.4.6-4.4.9/4.8.1) sind
+// zurueckgebaut. Index 4/5 lagen bis Rev 4.11.2 auf GPIO32/33, seit Rev
+// 4.11.3 auf GPIO4/13 (siehe AIR_PINS[]-Kommentar oben - Grund: GPIO-
+// Interrupt-Dispatch-Bank-Bias, nicht Hardware-Diagnose).
 
-// x-Abstand Mic-Spalte<->vertikale Mittellinie ist bei beiden Zielarten
-// (Stahl/Papier) baugleich, daher ein fester Wert fuer beide Modi. Seit Rev
-// 4.7.3 nur noch der Default-Wert - der tatsaechlich genutzte Abstand ist
-// per SET MICHALFX laufzeitkonfigurierbar (cfg.micHalfXMm), siehe
-// applyMicHalfX() weiter unten (deckt z.B. ab, dass die Mikrofon-Membran
-// 1-2mm hinter der aeusseren, bisher vermessenen Huelle liegt).
+// x-Abstand Mic-Spalte<->vertikale Mittellinie. Seit Rev 4.7.3 nur noch der
+// Default-Wert - der tatsaechlich genutzte Abstand ist per SET MICHALFX
+// laufzeitkonfigurierbar (cfg.micHalfXMm), siehe applyMicHalfX() weiter unten
+// (deckt z.B. ab, dass die Mikrofon-Membran 1-2mm hinter der aeusseren,
+// bisher vermessenen Huelle liegt).
 #define MIC_HALF_X          115.0f  // mm, horizontaler Abstand Mic-Spalte<->Zentrum (Default)
-// Stahlblech (Abprallflaeche, Rev <= 4.x Default): Mics 100mm ueber/unter
-// Mitte, 30mm rechtwinklig vor der Platte.
-#define MIC_HALF_Y_STEEL    100.0f  // mm
-#define MIC_STANDOFF_STEEL   30.0f  // mm
-// Papierscheibe (Durchschlag-Messung, SET TARGET=PAPER): Mics 85mm
-// ueber/unter Mitte, 28mm rechtwinklig vor der Scheibe.
+// Papierscheibe (Durchschlag-Messung): Mics 85mm ueber/unter Mitte, 28mm
+// rechtwinklig vor der Scheibe (SET STANDOFFPAPER fuer den Standoff).
 #define MIC_HALF_Y_PAPER     85.0f  // mm
 #define MIC_STANDOFF_PAPER   28.0f  // mm
 
@@ -2077,24 +2186,21 @@ static void applySoundSpeed()
 #define MIC_OFS_MAX_NS  20000
 
 // MIC_X/MIC_Y/micStandoffMm sind laufzeitveraenderlich (SET MICHALFX bzw.
-// SET TARGET=STEEL|PAPER, siehe applyMicHalfX()/applyTargetGeometry()
-// unten) - MIC_X bleibt fuer beide Zielarten gleich, wird aber (anders als
-// frueher) nicht mehr vom Zielmodus, sondern nur noch von SET MICHALFX
-// bestimmt.
+// SET STANDOFFPAPER, siehe applyMicHalfX()/applyTargetGeometry() unten).
 //
 // Alle 3 Hardware-Diagnosetests (Mikrofon-Tausch GPIO27/32, LM339-Ausgang-
 // Tausch GPIO25/33, GPIO32->GPIO35) sind zurueckgebaut - MIC_X wieder auf
 // Normalstand. Test 3 betraf ohnehin nur AIR_PINS[4] (siehe dortigen
 // Kommentar), nie die Geometrie hier (dasselbe Signal, nur anderer Pin).
 static float MIC_X[NUM_AIR] = { -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X, -MIC_HALF_X, +MIC_HALF_X };
-static float MIC_Y[NUM_AIR] = { -MIC_HALF_Y_STEEL, -MIC_HALF_Y_STEEL, +MIC_HALF_Y_STEEL, +MIC_HALF_Y_STEEL, 0.0f, 0.0f };
-static float micStandoffMm = MIC_STANDOFF_STEEL;
+static float MIC_Y[NUM_AIR] = { -MIC_HALF_Y_PAPER, -MIC_HALF_Y_PAPER, +MIC_HALF_Y_PAPER, +MIC_HALF_Y_PAPER, 0.0f, 0.0f };
+static float micStandoffMm = MIC_STANDOFF_PAPER;
 
 // Setzt MIC_X[] passend zum per SET MICHALFX gewaehlten horizontalen
 // Mic-Abstand zur Mittellinie. Wird beim Booten (nach loadConfig()) und bei
 // jeder Aenderung von SET MICHALFX aufgerufen - wirkt sofort, kein Reboot
-// noetig. Getrennt von applyTargetGeometry(), da der X-Abstand (anders als
-// Y-Abstand/Standoff) nicht vom Zielmodus abhaengt.
+// noetig. Getrennt von applyTargetGeometry(), da der X-Abstand unabhaengig
+// vom Standoff ist.
 static void applyMicHalfX()
 {
     MIC_X[0] = -cfg.micHalfXMm; MIC_X[1] = +cfg.micHalfXMm;
@@ -2103,20 +2209,26 @@ static void applyMicHalfX()
     updateRimMaxDist();   // SET ALGO=RIM, siehe dort
 }
 
-// Setzt MIC_Y[]/micStandoffMm passend zum per SET TARGET gewaehlten
-// Messmodus. Wird beim Booten (nach loadConfig()) und bei jeder Aenderung
-// von SET TARGET aufgerufen - wirkt sofort, kein Reboot noetig.
+// Setzt MIC_Y[]/micStandoffMm (Papierscheiben-Geometrie, siehe
+// MIC_HALF_Y_PAPER). Wird beim Booten (nach loadConfig()) und bei jeder
+// Aenderung von SET STANDOFFPAPER aufgerufen - wirkt sofort, kein Reboot
+// noetig. Bis Rev 4.11.0 gab es hier zusaetzlich einen per SET TARGET
+// waehlbaren STEEL-Modus (direkter Beschuss einer Stahlplatte ohne Papier,
+// andere Geometrie/Standoff) - seit Rev 4.11.1 entfernt, da nicht mehr
+// genutzt. Das Piezo (Koerperschall-Trigger, siehe PIEZO_PIN) sitzt
+// weiterhin auf einer Stahlplatte HINTER der Papierscheibe - das ist reine
+// Trigger-Hardware, unabhaengig von dieser (jetzt fest auf Papier stehenden)
+// Geometrie.
 //
 // Alle 3 Diagnose-Tests (AIR2<->AIR4-Mikrofontausch, GPIO25<->GPIO33-Tausch
 // am LM339-Ausgang, GPIO32->GPIO35) sind zurueckgebaut - MIC_Y wieder auf
 // Normalstand.
 static void applyTargetGeometry()
 {
-    const float halfY = (cfg.targetMode == TARGET_PAPER) ? MIC_HALF_Y_PAPER : MIC_HALF_Y_STEEL;
-    micStandoffMm      = (cfg.targetMode == TARGET_PAPER) ? cfg.standoffPaperMm : cfg.standoffSteelMm;
-    MIC_Y[0] = -halfY; MIC_Y[1] = -halfY;
-    MIC_Y[2] = +halfY; MIC_Y[3] = +halfY;
-    MIC_Y[4] = 0.0f;   MIC_Y[5] = 0.0f;
+    micStandoffMm = cfg.standoffPaperMm;
+    MIC_Y[0] = -MIC_HALF_Y_PAPER; MIC_Y[1] = -MIC_HALF_Y_PAPER;
+    MIC_Y[2] = +MIC_HALF_Y_PAPER; MIC_Y[3] = +MIC_HALF_Y_PAPER;
+    MIC_Y[4] = 0.0f;              MIC_Y[5] = 0.0f;
     updateRimMaxDist();   // SET ALGO=RIM, siehe dort
 }
 
@@ -2128,7 +2240,7 @@ static void applyTargetGeometry()
 // ---------------------------------------------------------------------------
 
 // Groesste denkbare Distanz Einschlag<->Mikrofon bei der AKTUELLEN Geometrie
-// (SET MICHALFX/STANDOFFSTEEL/STANDOFFPAPER) plus Sicherheitsmarge - begrenzt
+// (SET MICHALFX/STANDOFFPAPER) plus Sicherheitsmarge - begrenzt
 // das Zeitfenster, in dem eine Flanke ueberhaupt noch als Direktschall in
 // Frage kommt (shotloc::Geometry::maxDistMm). Wird bei jeder Aenderung der
 // Geometrie neu berechnet (siehe applyMicHalfX()/applyTargetGeometry()) statt
@@ -2237,12 +2349,25 @@ static bool solveAirPair(int ref, int a, int b, const int64_t tNs[NUM_AIR],
 // erlaubt): der ROHE Stufe-1-Wert VOR dem Verifizierungsschritt (siehe
 // dortigen Kommentar) - nur fuer SET DEBUG=3 gedacht, damit sich beide
 // Stufen miteinander vergleichen lassen.
+//
+// outResidualCorrMm (optional, NULL erlaubt): derselbe Rest-Fehler wie
+// outResidualMm (Mittel des Abstands zu den NICHT an der Stufe-1-Loesung
+// beteiligten Mics), aber MIT bereits angewandter Kugeldurchmesser-Korrektur
+// (SET BSHIFTPCT/BSHIFTCAP, siehe dortigen Block) - outResidualMm selbst
+// bleibt bewusst der reine Vorher-Wert (unveraendert fuer pos_res_um/das
+// SET-DEBUG=3-Telegramm). Fuer die Kalibrierung (calCostClassic()) ist
+// outResidualCorrMm das richtige Kostenmass: nur so wirkt sich SET
+// BSHIFTPCT/BSHIFTCAP ueberhaupt auf die gefundenen Mic-Offsets aus - vorher
+// wurde die Kalibrierung immer gegen den unkorrigierten Rest-Fehler
+// optimiert und ignorierte die Korrektur dadurch komplett, unabhaengig vom
+// eingestellten SET BSHIFTPCT-Wert.
 static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR],
                               float clusterRadiusMm, bool emitCandidateDebug,
                               float *outXmm, float *outYmm, float *outResidualMm,
                               float *outPrecisionMm, int *outClusterHits,
                               float *outXmmPre, float *outYmmPre,
-                              float *outPrecisionMmPre, int *outClusterHitsPre)
+                              float *outPrecisionMmPre, int *outClusterHitsPre,
+                              float *outResidualCorrMm)
 {
     int all[NUM_AIR], nAll = 0;
     for (int i = 0; i < NUM_AIR; i++) if (seen[i]) all[nAll++] = i;
@@ -2325,7 +2450,7 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
     // FRUEHER empfangen als es die Punktquelle bestX/bestY vorhersagt -> die
     // tatsaechliche Quelle lag naeher an diesem Mikrofon. bestX/bestY wird
     // deshalb je verbleibendem Mikrofon in dessen Richtung verschoben,
-    // gewichtet mit SET BSHIFTPCT (Default 50%) und je Mikrofon gedeckelt
+    // gewichtet mit SET BSHIFTPCT (Default 40%) und je Mikrofon gedeckelt
     // auf SET BSHIFTCAP (Default 3.0mm) - bewusst NUR auf die Stufe-1-
     // Loesung angewendet (wirkt dadurch automatisch auch als neue Referenz
     // fuer den Verifizierungsschritt/Stufe 2 unten), 0% schaltet ab.
@@ -2347,6 +2472,30 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
         }
         bestX += shiftX;
         bestY += shiftY;
+    }
+
+    // outResidualCorrMm: derselbe Rest-Fehler wie bestResidual, aber MIT der
+    // oben bereits angewandten Kugeldurchmesser-Korrektur (bestX/bestY) -
+    // bestD ist der Abstand vom Referenzmikrofon zur ROHEN Position (aus
+    // solveAirPair) und nach der Verschiebung nicht mehr gueltig, daher wird
+    // der Abstand vom Referenzmikrofon zur KORRIGIERTEN Position hier neu
+    // bestimmt (dRefCorr).
+    if (outResidualCorrMm) {
+        const float refDx = bestX - MIC_X[bestRef], refDy = bestY - MIC_Y[bestRef];
+        const float dRefCorr = sqrtf(refDx*refDx + refDy*refDy + micStandoffMm*micStandoffMm);
+        float corrResidualSum = 0.0f;
+        int   corrNCheck = 0;
+        for (int k = 0; k < nAll; k++) {
+            const int m = all[k];
+            if (m == bestRef || m == bestA || m == bestB) continue;
+            const float dc = sqrtf((bestX - MIC_X[m])*(bestX - MIC_X[m])
+                                  + (bestY - MIC_Y[m])*(bestY - MIC_Y[m])
+                                  + micStandoffMm*micStandoffMm);
+            const float rc = (float)(tNs[m] - tNs[bestRef]) * soundMmPerNs;
+            corrResidualSum += fabsf(dc - (dRefCorr + rc));
+            corrNCheck++;
+        }
+        *outResidualCorrMm = (corrNCheck > 0) ? (corrResidualSum / corrNCheck) : 0.0f;
     }
 
     // Praezision: quadratisch gemittelte Abweichung (RMS) der bis zu 2
@@ -2451,18 +2600,30 @@ static bool solveAirPosition(const int64_t tNs[NUM_AIR], const bool seen[NUM_AIR
 // Kosten am staerksten senkt; die Schrittweite wird pro Runde halbiert
 // (grob -> fein).
 //
-// Die Mic-Offsets nutzen als Kosten weiterhin den solveAirPosition()-Rest-
-// Fehler (Konsistenz der Loesung gegen die NICHT an ihr beteiligten Mics).
+// Die Mic-Offsets nutzen als Kosten den solveAirPosition()-Rest-Fehler
+// (Konsistenz der Loesung gegen die NICHT an ihr beteiligten Mics) - und
+// zwar den Rest-Fehler NACH Anwendung der Kugeldurchmesser-Korrektur (SET
+// BSHIFTPCT/BSHIFTCAP), nicht den reinen Vorher-Wert. Vorher (bis inkl. Rev
+// 4.11.3) wurde hier der unkorrigierte Rest-Fehler verwendet, wodurch SET
+// BSHIFTPCT/BSHIFTCAP komplett wirkungslos fuer die Kalibrier-Suche war -
+// egal welcher Wert eingestellt war, kamen immer dieselben Mic-Offsets
+// heraus. Bewusst NICHT stattdessen die Kandidaten-Clusterbreite
+// (precisionMm) als Kostenmass verwendet: die haengt nur von den zwei
+// naechstgelegenen Kandidaten ab und ist dadurch genauso "gamebar" wie das
+// analoge minMics=3-Problem bei calCostRim() - die Suche kann dann einen
+// zufaellig eng geclusterten, aber falschen Punkt finden statt der echten
+// Kalibrierung (im Simulator-Regressionstest nachgewiesen).
 // SET SOUNDSPEED wird bewusst NICHT mitkalibriert (siehe Rev-4.5.1-Hinweis
 // ganz oben) - blieb in der Praxis wiederholt bei unplausiblen Werten haengen
 // (zuletzt 363 m/s bei nur 5 Kalibrier-Schuessen) und bleibt daher ein rein
 // manueller Parameter.
 
 // Kosten der aktuell angenommenen Offsets ueber alle gesammelten Kalibrier-
-// Schuesse (Summe der Rest-Fehler, immer der Stufe-1-Wert - siehe
-// solveAirPosition() - unveraendert durch den Verifizierungsschritt).
-// Schuesse, die damit keine Loesung mehr ergeben (geometrisch entartet),
-// werden mit einem Strafwert belegt statt ignoriert zu werden.
+// Schuesse (Summe der Rest-Fehler NACH Kugeldurchmesser-Korrektur, siehe
+// solveAirPosition()/outResidualCorrMm - unveraendert durch den
+// Verifizierungsschritt). Schuesse, die damit keine Loesung mehr ergeben
+// (geometrisch entartet), werden mit einem Strafwert belegt statt ignoriert
+// zu werden.
 static float calCostClassic(const float offsets[NUM_AIR])
 {
     float total = 0.0f;
@@ -2473,13 +2634,14 @@ static float calCostClassic(const float offsets[NUM_AIR])
                          ? calRawNs[k][i] - (int64_t)lroundf(offsets[i])
                          : 0;
         }
-        float x, y, res, prec;
+        float x, y, res, prec, resCorr;
         int   hitsN;
         if (solveAirPosition(corrected, calSeenBuf[k],
                               (float)cfg.clusterRadiusUm / 1000.0f, false,
                               &x, &y, &res, &prec, &hitsN,
-                              nullptr, nullptr, nullptr, nullptr)) {
-            total += res;
+                              nullptr, nullptr, nullptr, nullptr,
+                              &resCorr)) {
+            total += resCorr;
         } else {
             total += 1000.0f;   // Strafe: macht Schuss unloesbar
         }
@@ -2505,8 +2667,7 @@ static float calCostRim(const float offsets[NUM_AIR])
     shotloc::Gate gate;
     gate.active  = true;
     gate.t0MinNs = -(float)cfg.piezoMaxUs * 1000.0f;
-    gate.t0MaxNs = (cfg.targetMode == TARGET_STEEL) ? 0.0f
-                                                     : -(float)cfg.piezoMinUs * 1000.0f;
+    gate.t0MaxNs = -(float)cfg.piezoMinUs * 1000.0f;
     shotloc::Params params;
     params.minMics = 3;
 
@@ -2682,20 +2843,16 @@ static void processShot()
         uint32_t dCC = localPiezoCC - localFirstAirCC;   // wrap-sicher
         piezoT0NsRaw = (int64_t)((uint64_t)dCC * 1000ULL / (uint64_t)cpuMHz);
     }
-    // PAPER: Geschoss muss die Papier->Stahl-Luecke (8-18cm) erst noch
-    // durchqueren, bevor das Piezo ausloest -> planmaessig SPAETER als der
-    // erste Luftschall-Treffer (SET PIEZOMIN..PIEZOMAX danach), siehe
-    // Rev-4.3-Hinweis oben. STEEL: Die Platte IST die Trefferflaeche - das
-    // Piezo sitzt direkt darauf (quasi latenzfreier Kontaktschall) und ist
-    // damit schneller als die Luftschall-Laufzeit zu JEDEM Mikrofon. Es
-    // loest folglich nahe t=0 aus (haeufig sogar exakt 0, wenn es selbst
-    // firstAirCC gesetzt hat) - eine Mindestverzoegerung (PIEZOMIN) ergibt
-    // hier keinen Sinn und wird deshalb nicht geprueft; PIEZOMAX bleibt als
-    // generelle Ausreisser-Obergrenze fuer beide Modi bestehen.
+    // Geschoss muss die Papier->Stahl-Luecke (8-18cm) erst noch durchqueren,
+    // bevor das Piezo ausloest -> planmaessig SPAETER als der erste
+    // Luftschall-Treffer (SET PIEZOMIN..PIEZOMAX danach), siehe Rev-4.3-
+    // Hinweis oben. [Bis Rev 4.11.0 gab es hier zusaetzlich einen STEEL-
+    // Modus, in dem die Platte selbst die Trefferflaeche war und PIEZOMIN
+    // deshalb nicht geprueft wurde - seit Rev 4.11.1 entfernt, PIEZOMIN gilt
+    // jetzt immer.]
     bool piezoOk = localPiezoSeen
                  && piezoT0NsRaw <= (int64_t)cfg.piezoMaxUs * 1000LL
-                 && (cfg.targetMode == TARGET_STEEL
-                     || piezoT0NsRaw >= (int64_t)cfg.piezoMinUs * 1000LL);
+                 && piezoT0NsRaw >= (int64_t)cfg.piezoMinUs * 1000LL;
 
     // Kalibrierung (CAL START) laeuft unabhaengig vom normalen Reject-Filter
     // und vom SET DEBUG-Level mit - der Bediener braucht sofort Feedback.
@@ -2787,7 +2944,8 @@ static void processShot()
                                     cfg.debug >= 3,
                                     &posX, &posY, &posRes,
                                     &posPrecision, &clusterHits,
-                                    &posXPre, &posYPre, &posPrecisionPre, &clusterHitsPre);
+                                    &posXPre, &posYPre, &posPrecisionPre, &clusterHitsPre,
+                                    nullptr); // Korrigierter Rest-Fehler wird nur fuer die Kalibrierung gebraucht (calCostClassic())
     long  xUm    = posOk ? lroundf(posX         * 1000.0f) : 0;
     long  yUm    = posOk ? lroundf(posY         * 1000.0f) : 0;
     long  resUm  = posOk ? lroundf(posRes       * 1000.0f) : 0;
@@ -3004,8 +3162,7 @@ static void processShotAnchored()
         shotloc::Gate gate;
         gate.active  = true;
         gate.t0MinNs = -(float)cfg.piezoMaxUs * 1000.0f;
-        gate.t0MaxNs = (cfg.targetMode == TARGET_STEEL) ? 0.0f
-                                                         : -(float)cfg.piezoMinUs * 1000.0f;
+        gate.t0MaxNs = -(float)cfg.piezoMinUs * 1000.0f;
 
         shotloc::Params params;
         params.minMics = cfg.minMics;
@@ -3105,17 +3262,16 @@ static void sendHelp()
         "#                            in 0.001mm (Default 2000)",
         "#   SET MINMICS=<3-6>        Mindestzahl Mics fuer gueltigen Schuss (Default 5)",
         "#   SET TDOA=<100-5000>      Geometrie-Plausibilitaetsfenster in us (Default 750)",
-        "#   SET TARGET=<STEEL|PAPER> Messmodus/Mic-Geometrie (Default STEEL)",
-        "#   SET STANDOFFSTEEL=<5.0-100.0>  Mic-Standoff (rechtwinklig zur Platte)",
-        "#                            in mm, STEEL-Modus (Default 30.0)",
-        "#   SET STANDOFFPAPER=<5.0-100.0>  Wie STANDOFFSTEEL, PAPER-Modus (Default 28.0)",
-        "#   SET MICHALFX=<5.0-300.0> Horizontaler Mic-Abstand zur Mittellinie in mm,",
-        "#                            fuer STEEL UND PAPER gleich (Default 115.0)",
+        "#   SET STANDOFFPAPER=<5.0-100.0>  Mic-Standoff (rechtwinklig zur Scheibe)",
+        "#                            in mm (Default 28.0)",
+        "#   SET MICHALFX=<5.0-300.0> Horizontaler Mic-Abstand zur Mittellinie in mm",
+        "#                            (Default 115.0)",
         "#   SET BSHIFTPCT=<0-100>    Kugeldurchmesser-Korrektur (siehe solveAirPosition()):",
         "#                            Gewichtung in % des Rest-Fehlers der Stufe-1-Loesung",
         "#                            gegen die daran unbeteiligten Mikrofone, als Ver-",
-        "#                            schiebung Richtung/weg vom jeweiligen Mikrofon",
-        "#                            (Default 50, 0=Korrektur aus)",
+        "#                            schiebung Richtung/weg vom jeweiligen Mikrofon,",
+        "#                            fliesst auch in CAL START mit ein (Default 40,",
+        "#                            0=Korrektur aus)",
         "#   SET BSHIFTCAP=<0.0-20.0> Kappung der Kugeldurchmesser-Korrektur je Mikrofon",
         "#                            in mm (Default 3.0). Gilt NUR fuer ALGO=CLASSIC",
         "#   SET ALGO=<CLASSIC|RIM>   Auswertepfad (Default CLASSIC = bisheriges",
@@ -3135,12 +3291,10 @@ static void sendHelp()
         "#   SET PIEZO=<0|1>          Piezo (Stahlplatte, GPIO34) als Trigger-",
         "#                            Bestaetigung nutzen (Default 1/an)",
         "#   SET PIEZOMIN=<0-5000>    Min. erwartete Piezo-Verzoegerung in us",
-        "#                            nach erstem Luft-Ereignis (Default 100).",
-        "#                            Gilt NUR im TARGET=PAPER-Modus (im STEEL-",
-        "#                            Modus loest das Piezo quasi latenzfrei bei t=0 aus)",
+        "#                            nach erstem Luft-Ereignis (Default 100)",
         "#   SET PIEZOMAX=<0-5000>    Max. erwartete Piezo-Verzoegerung in us",
-        "#                            nach erstem Luft-Ereignis (Default 1400).",
-        "#                            Ausreisser-Obergrenze fuer STEEL UND PAPER",
+        "#                            nach erstem Luft-Ereignis (Default 1400) -",
+        "#                            Ausreisser-Obergrenze",
         "#   SET TESTMODE=<0|1>       Reiner Sensor-Testmodus (Klartext-Zeile je",
         "#                            Sensor-Ausloesung mit +ms seit dem 1. Sensor",
         "#                            der Serie, 10 '-' nach 5s Stille) - NICHT",
@@ -3230,20 +3384,6 @@ static void sendHelp()
         "#                            kein NET CONFIRM gesendet, stellt der ESP32 die",
         "#                            zuletzt bestaetigte Konfiguration automatisch wieder",
         "#                            her und startet neu)",
-        "# PIN-Diagnose (manuelles Setzen/Lesen einzelner GPIOs, NICHT persistent,",
-        "# nach Reboot wieder im normalen Betriebszustand):",
-        "#   PIN <n> IN               Pin als Eingang ohne Pull-Widerstand, liest sofort",
-        "#   PIN <n> PULLUP           Pin als Eingang mit internem Pull-Up, liest sofort",
-        "#   PIN <n> PULLDOWN         Pin als Eingang mit internem Pull-Down, liest sofort",
-        "#   PIN <n> OUT=<0|1>        Pin als Ausgang, auf LOW/HIGH setzen",
-        "#   PIN <n> READ             aktuellen Pegel im zuletzt gesetzten Modus lesen",
-        "#                            (Fehler, falls fuer <n> noch kein Modus gesetzt wurde)",
-        "#   PIN LIST                 IN/PULLUP/PULLDOWN/OUT-Status + Pegel aller",
-        "#                            erlaubten Pins auf einen Blick",
-        "#   Erlaubte Pins (Positivliste): 0, 2, 4, 15, 16, 17, 18, 19, 21 - davon sind",
-        "#   16/17/18/19/21 im Normalbetrieb der Papiervorschub (STEP/DIR/EN/Schalter),",
-        "#   ein PIN-Kommando ueberschreibt deren Modus/Pegel bis zum naechsten",
-        "#   Schritt-Impuls bzw. zur naechsten Schalter-Abfrage",
     };
     for (size_t i = 0; i < sizeof(lines) / sizeof(lines[0]); i++) {
         Serial.println(lines[i]);
@@ -3336,24 +3476,6 @@ static bool handleSet(const String &raw)
         cfg.airMaxTdoaUs = (uint32_t)v;
         saveVal<uint32_t>("tdoa_us", cfg.airMaxTdoaUs);
         emitf("{\"type\":\"ok\",\"set\":\"tdoa\",\"value\":%u}\n", cfg.airMaxTdoaUs);
-    } else if (key == "TARGET") {
-        String v = val; v.toUpperCase();
-        uint8_t newMode;
-        if (v == "STEEL")      newMode = TARGET_STEEL;
-        else if (v == "PAPER") newMode = TARGET_PAPER;
-        else { emitLine("{\"type\":\"error\",\"msg\":\"target steel|paper\"}\n"); return true; }
-        cfg.targetMode = newMode;
-        saveVal<uint8_t>("target", cfg.targetMode);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"target\",\"value\":\"%s\"}\n",
-              cfg.targetMode == TARGET_PAPER ? "paper" : "steel");
-    } else if (key == "STANDOFFSTEEL") {
-        float v = val.toFloat();
-        if (v < 5.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"standoffsteel 5.0-100.0\"}\n"); return true; }
-        cfg.standoffSteelMm = v;
-        saveVal<float>("standoff_st", cfg.standoffSteelMm);
-        applyTargetGeometry();
-        emitf("{\"type\":\"ok\",\"set\":\"standoffsteel\",\"value\":%.2f}\n", cfg.standoffSteelMm);
     } else if (key == "STANDOFFPAPER") {
         float v = val.toFloat();
         if (v < 5.0f || v > 100.0f) { emitLine("{\"type\":\"error\",\"msg\":\"standoffpaper 5.0-100.0\"}\n"); return true; }
@@ -3612,107 +3734,6 @@ static bool handleSet(const String &raw)
 }
 
 // ---------------------------------------------------------------------------
-// PIN-Diagnose - manuelles Setzen/Lesen einzelner GPIOs zur Hardware-/
-// Verkabelungsfehlersuche (z.B. Verdacht auf einen defekten Pin), unabhaengig
-// von der sonstigen Schuss-/Papiervorschub-Logik. NICHT NVS-persistent (wie
-// SET TESTMODE) - nach einem Reboot ist jeder Pin wieder in seinem normalen
-// Betriebszustand (siehe setup()).
-//
-// ACHTUNG: Positivliste bewusst eng gehalten. Wer einen Pin hierueber
-// umkonfiguriert, der gleichzeitig von einem anderen Subsystem genutzt wird
-// (hier: GPIO16-19/21 vom Papiervorschub, siehe PAPER_*_PIN), ueberschreibt
-// dessen Pin-Modus/-Pegel, bis der jeweils naechste Vorgang (Schritt-Impuls,
-// Schalter-Abfrage) das wieder passend setzt - fuer eine gezielte
-// Pin-Fehlersuche ist genau das gewuenscht, im laufenden Betrieb sollte man
-// diese Pins aber nicht gleichzeitig per PIN-Kommando anfassen.
-static const uint8_t PIN_DIAG_ALLOWED[] = {0, 2, 4, 15, 16, 17, 18, 19, 21};
-
-static bool pinDiagAllowed(int pin)
-{
-    for (size_t i = 0; i < sizeof(PIN_DIAG_ALLOWED); i++) {
-        if (PIN_DIAG_ALLOWED[i] == pin) return true;
-    }
-    return false;
-}
-
-// Merkt sich je Pin den zuletzt per PIN-Kommando gesetzten Modus - PIN <n>
-// READ liest damit einfach den aktuellen Pegel im zuletzt gesetzten Modus,
-// ohne pinMode() erneut aufzurufen (bei OUTPUT wuerde ein digitalRead() sonst
-// ohnehin nur den zuletzt geschriebenen Ausgangswert zurueckgeben, nicht den
-// externen Signalpegel - genau deshalb braucht READ vorher IN/PULLUP/
-// PULLDOWN, um wirklich den von aussen anliegenden Pegel zu sehen).
-enum PinDiagMode : uint8_t { PINDIAG_UNSET, PINDIAG_IN, PINDIAG_PULLUP, PINDIAG_PULLDOWN, PINDIAG_OUT };
-static PinDiagMode pinDiagMode[40] = { PINDIAG_UNSET };   // Index = GPIO-Nummer
-
-static const char *pinDiagModeName(PinDiagMode m)
-{
-    switch (m) {
-        case PINDIAG_IN:       return "in";
-        case PINDIAG_PULLUP:   return "pullup";
-        case PINDIAG_PULLDOWN: return "pulldown";
-        case PINDIAG_OUT:      return "out";
-        default:               return "unset";
-    }
-}
-
-static void pinDiagReport(int pin)
-{
-    emitf("{\"type\":\"pin\",\"gpio\":%d,\"mode\":\"%s\",\"level\":%d}\n",
-          pin, pinDiagModeName(pinDiagMode[pin]), digitalRead(pin));
-}
-
-// upperRest = alles nach "PIN " (bereits getrimmt/GROSS, siehe handleCommand())
-static void handlePinCommand(const String &upperRest)
-{
-    if (upperRest == "LIST") {
-        for (size_t i = 0; i < sizeof(PIN_DIAG_ALLOWED); i++) {
-            pinDiagReport(PIN_DIAG_ALLOWED[i]);
-        }
-        return;
-    }
-
-    int sp = upperRest.indexOf(' ');
-    if (sp < 0) {
-        emitLine("{\"type\":\"error\",\"msg\":\"pin syntax: PIN <n> IN|PULLUP|PULLDOWN|OUT=0|1|READ, or PIN LIST\"}\n");
-        return;
-    }
-    int    pin    = upperRest.substring(0, sp).toInt();
-    String action = upperRest.substring(sp + 1);
-    action.trim();
-
-    if (!pinDiagAllowed(pin)) {
-        emitf("{\"type\":\"error\",\"msg\":\"pin %d not allowed\"}\n", pin);
-        return;
-    }
-
-    if (action == "READ") {
-        if (pinDiagMode[pin] == PINDIAG_UNSET) {
-            emitf("{\"type\":\"error\",\"msg\":\"pin %d mode not set, use IN|PULLUP|PULLDOWN|OUT first\"}\n", pin);
-            return;
-        }
-    } else if (action == "IN") {
-        pinMode(pin, INPUT);
-        pinDiagMode[pin] = PINDIAG_IN;
-    } else if (action == "PULLUP") {
-        pinMode(pin, INPUT_PULLUP);
-        pinDiagMode[pin] = PINDIAG_PULLUP;
-    } else if (action == "PULLDOWN") {
-        pinMode(pin, INPUT_PULLDOWN);
-        pinDiagMode[pin] = PINDIAG_PULLDOWN;
-    } else if (action.startsWith("OUT=")) {
-        long v = action.substring(4).toInt();
-        if (v != 0 && v != 1) { emitLine("{\"type\":\"error\",\"msg\":\"pin out 0|1\"}\n"); return; }
-        pinMode(pin, OUTPUT);
-        digitalWrite(pin, v ? HIGH : LOW);
-        pinDiagMode[pin] = PINDIAG_OUT;
-    } else {
-        emitLine("{\"type\":\"error\",\"msg\":\"pin action: IN|PULLUP|PULLDOWN|OUT=0|1|READ\"}\n");
-        return;
-    }
-    pinDiagReport(pin);
-}
-
-// ---------------------------------------------------------------------------
 // ACTION-Namensraum (Rev 4.9.0) - kurzlebige Bedienbefehle, bewusst getrennt
 // von SET (das persistente Konfiguration ist): siehe docs/remote-
 // interaktion-konzept.md Abschnitt 6. upperRest = alles nach "ACTION "
@@ -3754,7 +3775,7 @@ static void handleActionCommand(const String &upperRest)
 // gleichverteilt in [-z_mm, +z_mm] mm (Default z_mm=25.0, "gesamte LG-
 // Scheibe"), berechnet daraus fuer jeden aktiven Mikrofonkanal (SET MICEN0..
 // MICEN5) die nach AKTUELLER Kalibrierung (SET OFS0..OFS5, Zielgeometrie
-// SET TARGET/STANDOFFSTEEL/STANDOFFPAPER/MICHALFX, SET SOUNDSPEED) passende
+// SET STANDOFFPAPER/MICHALFX, SET SOUNDSPEED) passende
 // Rohlaufzeit und speist sie GENAU in dieselben Puffer ein, die sonst
 // airISR()/piezoISR() fuellen (airCC/airCount/firstAirCC/firstHitTimeUs/
 // piezoCC/piezoSeen/shotInProgress). Der weitere Ablauf (Fensterlogik in
@@ -3816,13 +3837,9 @@ static void handleTestShoot(float zMm)
 
     // Piezo-Verzoegerung relativ zum ersten Luft-Ereignis, konsistent mit
     // processShot()/piezoOk (siehe Rev-4.3-Hinweis im Header-Kommentar):
-    // STEEL = quasi-latenzfrei (Kontaktschall direkt auf der Platte, dient
-    // hier als zeitlicher Nullpunkt - Luft-Mics kommen danach), PAPER =
     // Laufzeit durch die Papier->Stahl-Luecke, mittig im erlaubten Fenster
     // SET PIEZOMIN..PIEZOMAX gewaehlt.
-    const float piezoTargetNs = (cfg.targetMode == TARGET_STEEL)
-        ? 0.0f
-        : (float)(cfg.piezoMinUs + cfg.piezoMaxUs) * 1000.0f / 2.0f;
+    const float piezoTargetNs = (float)(cfg.piezoMinUs + cfg.piezoMaxUs) * 1000.0f / 2.0f;
 
     if (cfg.algoMode == ALGO_RIM) {
         // Ringpuffer-Pfad: Anker = Piezo (t=0), jede Mic-Flanke relativ dazu
@@ -3861,10 +3878,8 @@ static void handleTestShoot(float zMm)
         firstAirCC = esp_cpu_get_cycle_count();
         for (int i = 0; i < NUM_AIR; i++) {
             if (!seen[i]) { airCount[i] = 0; continue; }
-            // STEEL: Nullpunkt = Piezo (quasi-latenzfrei), Mics kommen danach.
-            // PAPER: Nullpunkt = fruehestes Mikrofon (minToFNs).
-            float targetNs = (cfg.targetMode == TARGET_STEEL)
-                ? rawToFNs[i] : (rawToFNs[i] - minToFNs);
+            // Nullpunkt = fruehestes Mikrofon (minToFNs).
+            float   targetNs = rawToFNs[i] - minToFNs;
             float   rawNsWithOffset = targetNs + (float)cfg.micOffsetNs[i];
             int32_t dCC = (int32_t)lroundf(rawNsWithOffset * (float)cpuMHz / 1000.0f);
             airCC[i][0] = firstAirCC + (uint32_t)dCC;
@@ -4121,12 +4136,6 @@ static void handleCommand(const String &rawCmd, bool viaTcp)
         } else {
             emitLine("{\"type\":\"error\",\"msg\":\"unknown cal command\"}\n");
         }
-        return;
-    }
-    if (upper.startsWith("PIN")) {
-        String rest = upper.substring(3);
-        rest.trim();
-        handlePinCommand(rest);
         return;
     }
     // Kurzformen aus Rev 3.0/3.1 – jetzt ebenfalls persistent:

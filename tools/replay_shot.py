@@ -297,7 +297,7 @@ def main():
 
     cfg = {
         "soundspeed": args.soundspeed or 355.0,
-        "target": args.target or "steel",
+        "target": args.target or "paper",
         "standoff": args.standoff,
         "half_y": args.half_y,
         "half_x": None,

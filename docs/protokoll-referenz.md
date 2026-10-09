@@ -7,7 +7,7 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
 `docs/remote-interaktion-konzept.md` im selben Repo).
 
 - Firmware-Datei: `src/schiessstand_firmware.ino`
-- Firmware-Version zum Zeitpunkt dieser Doku: **4.9.1**
+- Firmware-Version zum Zeitpunkt dieser Doku: **4.12.1**
 - Bei Abweichungen zwischen diesem Dokument und dem Quellcode gilt der
   Quellcode als maßgeblich.
 - Rev 4.9.0 hat die erste Umsetzungsstufe aus
@@ -22,6 +22,13 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
   Testschuss (zufällige Position, plausible Rohdaten nach aktueller
   Kalibrierung) zum Prüfen der Kommunikationsstrecke ohne echte Sensorik,
   siehe 5.7 und 7.7.
+- Rev 4.12.0 hat die Endposition bei `ALGO=CLASSIC` (Stufe 2) überarbeitet:
+  `SET CLUSTERCORR`, `SET CLUSTERITER`, `SET LSQ`, `SET LSQPELLETR` (siehe
+  5.2 und 7.3). **Achtung:** Die Defaults `CLUSTERCORR=1`/`CLUSTERITER=5`
+  ändern die gemeldeten Positionen gegenüber 4.11.x auch ohne neuen
+  `SET`-Befehl; `CLUSTERCORR=0` + `CLUSTERITER=0` + `LSQ=0` stellt das
+  bisherige Verhalten exakt wieder her. Außerdem trägt jetzt auch die
+  `config`-Antwort auf `SHOW #<id>` das `corr`-Feld (siehe 2).
 
 ---
 
@@ -88,7 +95,11 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
   Grenzfall, aber zu vermeiden). Ohne Suffix verhält sich alles wie zuvor:
   Antworten kommen in Verarbeitungsreihenfolge, ohne Suffix ist die einzige
   Zuordnungshilfe weiterhin die Reihenfolge plus charakteristische Felder
-  (`"set":"<key>"` in der `ok`-Antwort).
+  (`"set":"<key>"` in der `ok`-Antwort). **Bis Rev 4.11.5** fehlte `corr`
+  bei Zeilen über ca. 130 Byte - insbesondere bei der `config`-Antwort auf
+  `SHOW #<id>`, die dadurch beim Stand-PC in den Timeout lief. Seit Rev
+  4.12.0 wird `corr` an jede Zeile bis ca. 1000 Byte angehängt, also an
+  alle Telegramme dieser Firmware.
 
 ## 3. Verbindungslebenszyklus
 
@@ -97,17 +108,24 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
    SSID = WLAN komplett aus, keine Reconnect-Versuche).
 2. **WLAN-Verbindungsaufbau:** Standard DHCP, außer `SET STATIC=1` mit
    gültiger `SET IP`/`SET GW` - dann feste IP (`SET SUBNET`, `SET DNS`
-   optional, DNS-Default = Gateway).
+   optional, DNS-Default = Gateway). Seit Rev 4.12.1: ist das WLAN länger
+   als 30 s nicht verbunden (auch direkt nach dem Boot, z.B. weil der Access
+   Point noch nicht bereit ist), startet der ESP32 den WLAN-Verbindungsaufbau
+   selbst neu - unabhängig davon, ob der Core-Autoreconnect aufgegeben hat.
 3. **TCP-Verbindungsaufbau** (`maintainNetwork()`, aufgerufen bei jedem
    `loop()`): sobald WLAN verbunden ist, versucht der ESP32 `tcp.connect(host,
    port, timeout=2000ms)`. Bei Erfolg: `tcp.setNoDelay(true)` (kein
-   Nagle-Delay), danach wird **sofort ein `status`-Telegramm gesendet**
-   (Abschnitt 4.2).
+   Nagle-Delay) und TCP-Keepalive (5 s Leerlauf, 2 s Intervall, 3 Proben),
+   danach wird **sofort ein `status`-Telegramm gesendet** (Abschnitt 4.2).
 4. **Reconnect-Backoff bei Fehlschlag:** Startwert 1000 ms, verdoppelt sich
-   nach jedem Fehlschlag bis maximal 15000 ms. Kein Backoff-Reset außer bei
-   erfolgreicher Verbindung. Bricht die WLAN-Verbindung selbst ab
-   (`WiFi.status() != WL_CONNECTED`), wird die TCP-Verbindung sofort beendet
-   (`tcp.stop()`) und der Zyklus beginnt nach WLAN-Reconnect neu.
+   nach jedem Fehlschlag bis maximal 8000 ms (bis Rev 4.12.0: 16000 ms).
+   Backoff-Reset bei erfolgreicher Verbindung und nach jedem
+   WLAN-(Wieder-)Verbindungsaufbau (dann sofortiger TCP-Versuch). Bricht die
+   WLAN-Verbindung selbst ab (`WiFi.status() != WL_CONNECTED`), wird die
+   TCP-Verbindung sofort beendet (`tcp.stop()`) und der Zyklus beginnt nach
+   WLAN-Reconnect neu. Schließt der Stand-PC die Verbindung (FIN/RST), baut
+   der ESP32 sie sofort neu auf; ist der Stand-PC ohne Abmeldung weg
+   (abgeschaltet), erkennt der Keepalive das nach ca. 11 s.
 5. **Nach jedem Boot** sendet der ESP32 unmittelbar nach `setup()`:
    `status` gefolgt von `{"type":"ready"}`. Das ist der früheste Zeitpunkt,
    zu dem über Serial etwas ankommt (WLAN/TCP können zu diesem Zeitpunkt
@@ -190,14 +208,15 @@ Gesendet: auf `SHOW`-Befehl, und automatisch am Ende von `CAL START`
 
 ```json
 {"type":"config","mac":"AA:BB:CC:DD:EE:FF","lane":1,"debounce_ms":100,
- "window_ms":1,"debug":0,
+ "reject_lockout_ms":5,"send_reject":0,"window_ms":1,"debug":0,
  "outlier_um":5000,"cluster_radius_um":200,"min_cluster_hits":2,
  "max_precision_um":2000,"min_mics":5,"tdoa_us":750,
  "mic_offset_ns":[0,0,0,0,0,0],"mic_enabled":[1,1,1,1,1,1],"cal_shots":10,
  "standoff_paper_mm":28.00,
  "mic_half_x_mm":115.00,"bullet_shift_pct":40,"bullet_shift_cap_mm":3.00,
+ "cluster_corr":1,"cluster_iter":5,"lsq":0,"lsq_pellet_r_mm":2.25,
  "algo":"classic","pellet_r_mm":2.25,"max_sigma_um":2000,
- "use_piezo":1,"piezo_min_us":100,"piezo_max_us":1400,
+ "use_piezo":1,"piezo_req":1,"piezo_min_us":100,"piezo_max_us":1400,
  "test_cooldown_ms":3000,"offset_x_um":0,"offset_y_um":0,"sound_mps":343,
  "paper_feed_mm":50.00,"paper_speed_mmps":5.00,"paper_auto":1,
  "paper_trigger":"piezo","paper_dir_invert":1,"paper_jog_speed_mmps":75.00}
@@ -237,9 +256,16 @@ Gesendet nur auf `SHOWNET`-Befehl (nicht automatisch bei Connect).
 
 **Jede** Auslösung (mindestens 1 Mikrofon getriggert) erzeugt genau **eine**
 Telegrammzeile, entweder `shot` oder `reject` - abhängig davon, ob die
-Mindestzahl an Mikrofonen (`SET MINMICS`) erreicht wurde. Beide teilen sich
-den fortlaufenden `seq`-Zähler (siehe unten), es gibt **keinen** Fall, in dem
-eine Auslösung spurlos verschwindet.
+Mindestzahl an Mikrofonen (`SET MINMICS`) erreicht wurde.
+
+**Seit Rev 4.11.5 (`SET SENDREJECT`, Default 0):** `reject`-Telegramme gehen
+standardmäßig **nur über Serial** raus, **nicht per TCP** (auch nicht über den
+Reconnect-Puffer, 3.7), und tragen dann **kein** `seq`-Feld. `seq` und der
+`shots`-Zähler (4.2) werden in diesem Modus nur bei gültigen `shot`-
+Telegrammen erhöht - der Stand-PC sieht also eine lückenlose `seq`-Folge nur
+aus `shot`-Zeilen. Mit `SET SENDREJECT=1` gilt das bisherige Verhalten (Rev
+4.6.1-4.11.4): `reject` geht auch per TCP und teilt sich den fortlaufenden
+`seq`-Zähler mit `shot`, keine Auslösung verschwindet spurlos.
 
 **Ablaufreihenfolge pro Auslösung** (wichtig für die Implementierung der
 Stand-PC-Seite):
@@ -248,7 +274,13 @@ Stand-PC-Seite):
 2. Automatischer Papiervorschub wird ggf. **schon hier** ausgelöst
    (`PAPERTRIGGER=ANY|PIEZO`), noch bevor feststeht, ob genug Mikrofone für
    eine Positionslösung vorhanden sind.
-3. Reject-Prüfung (`airHits < MINMICS`) → `reject`-Telegramm, **fertig**.
+3. Reject-Prüfung (`airHits < MINMICS`) → `reject`-Telegramm (per TCP nur
+   bei `SENDREJECT=1`), **fertig**.
+3b. Seit Rev 4.11.5, nur bei `SET PIEZO=1` und `SET PIEZOREQ=1` (Default):
+   ohne gültige Piezo-Bestätigung (kein Piezo-Signal oder außerhalb
+   `PIEZOMIN`..`PIEZOMAX`) ebenfalls `reject` (`reason` `"no piezo"` bzw.
+   `"piezo out of window"`), **fertig**. Mit `PIEZOREQ=0` wird ein solcher
+   Schuss wie bis Rev 4.11.4 als `shot` mit `piezo_ok:0`/`clean:0` gemeldet.
 4. Sonst: Trilateration, ggf. `cand`-Debug-Zeilen (nur `SET DEBUG=3`),
    `shot`-Telegramm.
 5. `PAPERTRIGGER=CLEAN` wird ggf. erst **hier** ausgelöst (nach Feststehen
@@ -262,9 +294,9 @@ Stand-PC-Seite):
 
 | Feld | Typ | Bedeutung |
 |---|---|---|
-| `seq` | uint | fortlaufende Sequenznummer, gemeinsam mit `shot` (siehe unten) |
+| `seq` | uint | **nur bei `SET SENDREJECT=1`**: fortlaufende Sequenznummer, gemeinsam mit `shot` (siehe unten). Bei `SENDREJECT=0` (Default) fehlt das Feld, und die Zeile erscheint nur auf Serial |
 | `algo` | `"classic"` oder `"rim"` | **seit Rev 4.11.0**: welcher Auswertepfad (`SET ALGO`) dieses Telegramm erzeugt hat - wichtig, weil `air_ns`/die übrigen Feldnamen je nach Pfad unterschiedlich zu interpretieren sind (siehe 4.5b) |
-| `reason` | string | bei `algo:"classic"` immer `"only <n> mic(s)"`; bei `algo:"rim"` zusätzlich möglich: `"fit failed"` (Gate/Ausgleichsrechnung ohne Lösung trotz genug Mikrofonen) |
+| `reason` | string | bei `algo:"classic"` `"only <n> mic(s)"`, seit Rev 4.11.5 (nur `PIEZO=1` + `PIEZOREQ=1`) zusätzlich `"no piezo"` oder `"piezo out of window"`; bei `algo:"rim"` zusätzlich möglich: `"fit failed"` (Gate/Ausgleichsrechnung ohne Lösung trotz genug Mikrofonen) |
 | `hits` | int | Anzahl Mikrofone, die ausgelöst haben (nach `SET MICEN<i>`-Maskierung) |
 | `piezo_ns` | int oder `null` | nur vorhanden, wenn `SET PIEZO=1`: Verzögerung des Piezo-Signals relativ zum ersten Luftschall-Ereignis in ns, oder `null` falls Piezo nicht ausgelöst hat. **Feld fehlt komplett**, wenn `SET PIEZO=0`. |
 | `synthetic` | 1, sonst fehlt das Feld | **nur bei `TESTSHOOT`** (seit Rev 4.9.1, siehe 5.7/7.7): markiert einen synthetischen Testschuss - bei echten Auslösungen fehlt dieses Feld komplett |
@@ -282,7 +314,7 @@ Stand-PC-Seite):
 
 | Feld | Typ | Bedeutung |
 |---|---|---|
-| `seq` | uint | fortlaufende Sequenznummer über **alle** Auslösungen (shot+reject zusammen), beginnt bei 1 nach Boot oder `RESET`-Befehl, **überläuft nicht in der Praxis** (uint32) |
+| `seq` | uint | fortlaufende Sequenznummer, beginnt bei 1 nach Boot oder `RESET`-Befehl, **überläuft nicht in der Praxis** (uint32). Bei `SET SENDREJECT=0` (Default) zählen nur `shot`-Telegramme, bei `SENDREJECT=1` alle Auslösungen (shot+reject zusammen) |
 | `algo` | `"classic"` oder `"rim"` | **seit Rev 4.11.0**, siehe oben bei `reject` und 4.5b |
 | `air_ns` | Array[6] von Arrays | **nur bei `algo:"classic"`** (siehe 4.5b für `algo:"rim"`): pro Mikrofonkanal (Index = Kanal, siehe 7.1) alle erfassten Flankenzeiten in ns relativ zum ersten Ereignis des Fensters (`firstAirCC`); leeres Array `[]` = Kanal hat in diesem Fenster nicht ausgelöst; **erste Flanke pro Kanal** (`air_ns[i][0]`) ist die für die Positionslösung verwendete Zeit; weitere Flanken (Nachschwinger/Mehrfachtrigger) sind rein informativ |
 | `x_um_pre`,`y_um_pre`,`precision_um_pre`,`cluster_hits_pre` | — | **nur bei `SET DEBUG=3`**: Roh-Position vor dem Verifizierungsschritt (siehe 7.3), zum Vergleich mit dem finalen Ergebnis |
@@ -444,8 +476,9 @@ Werte case-sensitiv.
 | `PORT` | 1-65535 | 9000 | ✅ | TCP-Port des Stand-PC |
 | `LANE` | 1-999 | 1 | – | Bahnnummer |
 | `DEBOUNCE` | 10-5000 (ms) | 100 | – | Sperrzeit nach einer Auslösung |
+| `SENDREJECT` | 0/1 | 0 | – | 0 = `reject` nur über Serial, ohne `seq`, zählt nicht in `seq`/`shots`; 1 = `reject` auch per TCP, mit gemeinsamer `seq` (Verhalten bis Rev 4.11.4), siehe 4.5 |
 | `WINDOW` | 1-50 (ms) | 1 | – | Mindest-Sammelfenster (wird bei aktivem Piezo automatisch bis `PIEZOMAX+200µs` verlängert). Nur `ALGO=CLASSIC` - bei `ALGO=RIM` wirkungslos, siehe 4.5b |
-| `DEBUG` | 0-3 | 0 | – | 3 = zusätzliche `cand`/`*_pre`-Diagnosefelder; `shot`/`reject` selbst gehen immer raus |
+| `DEBUG` | 0-3 | 0 | – | 3 = zusätzliche `cand`/`*_pre`-Diagnosefelder; `shot`/`reject` selbst gehen unabhängig davon raus (`reject` per TCP nur bei `SENDREJECT=1`) |
 | `OUTLIER` | 0-500000 (0.001mm) | 5000 | – | Schwelle für `pos_res_um` in `clean`-Bewertung (nur `ALGO=CLASSIC`) |
 | `RADIUS` | 0-500000 (0.001mm) | 200 | – | Umkreis für `cluster_hits` und Verifizierungs-Mittelpunkt (nur `ALGO=CLASSIC`) |
 | `MINCLUSTER` | 0-20 | 2 | – | Mindest-`cluster_hits` für `clean` (nur `ALGO=CLASSIC`) |
@@ -456,10 +489,15 @@ Werte case-sensitiv.
 | `MICHALFX` | 5.0-300.0 (mm) | 115.0 | – | horizontaler Mic-Abstand zur Mittellinie |
 | `BSHIFTPCT` | 0-100 (%) | 40 | – | Kugeldurchmesser-Korrektur, 0=aus (nur `ALGO=CLASSIC`) - seit Rev 4.11.4 Teil der `CAL START`-Kostenfunktion, siehe 7.4 |
 | `BSHIFTCAP` | 0.0-20.0 (mm) | 3.0 | – | Kappung der Korrektur je Mikrofon (nur `ALGO=CLASSIC`) |
+| `CLUSTERCORR` | 0/1 | 1 | – | **seit Rev 4.12.0**: 1 = alle Schnittpunkte werden vor der Mittelung in Stufe 2 kugeldurchmesser-korrigiert (`BSHIFTPCT`/`BSHIFTCAP`, wirkungslos bei `BSHIFTPCT=0`); 0 = nur die Stufe-1-Lösung (Verhalten bis 4.11.5). Bei 1 beziehen sich `cluster_hits`/`precision_um` auf die korrigierten Punkte. Nur `ALGO=CLASSIC`, siehe 7.3 |
+| `CLUSTERITER` | 0-10 | 5 | – | **seit Rev 4.12.0**: zusätzliche Durchgänge, in denen der `RADIUS`-Cluster um den jeweils neuen Mittelpunkt neu gebildet wird (Mean-Shift, Abbruch sobald stabil); 0 = einmalig um die Stufe-1-Lösung (bis 4.11.5). Nur `ALGO=CLASSIC` |
+| `LSQ` | 0/1 | 0 | – | **seit Rev 4.12.0**: Endposition zusätzlich per Ausgleichsrechnung über alle ausgelösten Mics verfeinern (braucht ≥ 4 Mics, bei ≥ 5 Echo-Schutz durch probeweises Weglassen eines Mics). Bei Fehlschlag bleibt die Cluster-Position. Nur `ALGO=CLASSIC` |
+| `LSQPELLETR` | 0.0-5.0 (mm) | 2.25 | – | **seit Rev 4.12.0**: Lochrand-Radius für `LSQ` (0 = Punktquelle) - unabhängig von `PELLETR` (`ALGO=RIM`) |
 | `ALGO` | `CLASSIC`\|`RIM` | `CLASSIC` | – | **seit Rev 4.11.0**: Auswertepfad, siehe 4.5b/7.3b. `RIM` ignoriert `PIEZO=0` (Piezo ist dort immer der Trigger) |
 | `PELLETR` | 0.0-10.0 (mm) | 2.25 | – | Lochrand-Radius für `ALGO=RIM` (0=Punktquelle) |
 | `MAXSIGMA` | 0.0-50.0 (mm) | 2.0 | – | `clean`-Schwelle für `ALGO=RIM` (max. 1-Sigma-Unsicherheit) |
 | `PIEZO` | 0\|1 | 1 | – | Piezo als Trigger-Bestätigung nutzen |
+| `PIEZOREQ` | 0/1 | 1 | – | nur wirksam bei `PIEZO=1` und `ALGO=CLASSIC`: 1 = Schuss ohne gültige Piezo-Bestätigung wird `reject` (siehe 4.5, Schritt 3b), 0 = `shot` mit `piezo_ok:0`/`clean:0` |
 | `PIEZOMIN` | 0-5000 (µs) | 100 | – | Min. erwartete Piezo-Verzögerung nach dem ersten Luft-Ereignis |
 | `PIEZOMAX` | 0-5000 (µs) | 1400 | – | Max. erwartete Piezo-Verzögerung / Ausreißer-Obergrenze |
 | `TESTMODE` | 0\|1 | 0 | – (nicht persistent) | Sensor-Diagnosemodus, siehe Abschnitt 8 |
@@ -691,7 +729,19 @@ Gilt für `SET ALGO=CLASSIC` (Default). Für `SET ALGO=RIM` siehe 7.3b.
    innerhalb `SET RADIUS` um die Stufe-1-Lösung wird als finales Ergebnis
    verwendet (robuster als eine einzelne Dreier-Kombination) → `x_um`/`y_um`.
    `cluster_hits`/`precision_um` werden relativ zu diesem finalen Punkt neu
-   berechnet.
+   berechnet. Seit Rev 4.12.0:
+   - `SET CLUSTERCORR=1` (Default): Jeder Kandidat wird vorher mit
+     derselben Kugeldurchmesser-Korrektur wie in Schritt 3 verschoben (mit
+     seiner eigenen Referenz und seinen eigenen nicht beteiligten Mics).
+   - `SET CLUSTERITER=n` (Default 5): Der Cluster wird bis zu `n`-mal um den
+     jeweils neuen Mittelpunkt neu gebildet (Mean-Shift).
+   - `SET LSQ=1` (Default 0): Anschließend wird die Position per
+     Gauss-Newton-Ausgleichsrechnung über x, y und die Startzeit mit allen
+     ausgelösten Mics verfeinert (Modell: Schall vom nächstgelegenen Punkt
+     des Lochrands, Radius `LSQPELLETR`).
+
+   `CLUSTERCORR=0` + `CLUSTERITER=0` + `LSQ=0` entspricht exakt dem
+   Verhalten bis Rev 4.11.5.
 5. `SET OFFSETX`/`OFFSETY` werden **erst danach** addiert (reine
    Nachkorrektur, z.B. gegen Messgitter-Versatz) - beeinflusst NICHT
    `pos_res_um`/`precision_um`/`cluster_hits`.
@@ -745,7 +795,9 @@ wird intern die RMS-Residuen-Summe der Ausgleichsrechnung statt der
    `ALGO=CLASSIC` ist das seit Rev 4.11.4 der Rest-Fehler **nach** Anwendung
    der Kugeldurchmesser-Korrektur (`SET BSHIFTPCT`/`BSHIFTCAP`), nicht mehr
    der reine `pos_res_um`-Wert davor - vorher war `BSHIFTPCT`/`BSHIFTCAP` für
-   die Kalibrier-Suche komplett wirkungslos.
+   die Kalibrier-Suche komplett wirkungslos. `CLUSTERCORR`/`CLUSTERITER`/`LSQ`
+   (Rev 4.12.0) wirken nur auf die Endposition (Stufe 2) und ändern das
+   Kalibrierergebnis daher nicht, verlängern aber die Rechenzeit der Suche.
 4. Ergebnis wird **automatisch in NVS gespeichert** (`OFS0..OFS5`), `cal`/`"done"`
    gefolgt von einem vollen `config`-Telegramm.
 5. **`SOUNDSPEED` wird von diesem Vorgang nicht verändert** - trotz des
@@ -922,7 +974,9 @@ ist **nicht NVS-persistent** - ein Reboot beendet ihn zuverlässig.
    `status` sind Gerätezeit seit Boot. Der Stand-PC muss beim Empfang einer
    Zeile selbst einen Zeitstempel (Ankunftszeit) vergeben, wenn eine absolute
    Zeit gebraucht wird.
-4. **Sequenznummern (`seq`) laufen über `shot` UND `reject` gemeinsam** und
+4. **Sequenznummern (`seq`) zählen standardmäßig nur `shot`** (`SET
+   SENDREJECT=0`, Rejects kommen dann gar nicht per TCP an); nur bei
+   `SENDREJECT=1` laufen sie über `shot` UND `reject` gemeinsam. Sie
    beginnen bei `RESET` neu bei 0 - der Stand-PC sollte `seq`-Lücken/-
    Rücksprünge als Hinweis auf einen `RESET`-Befehl oder einen Neustart
    interpretieren, nicht als Fehler.
@@ -967,7 +1021,8 @@ ist **nicht NVS-persistent** - ein Reboot beendet ihn zuverlässig.
     Befehle - der TCP-Port bleibt weiterhin ohne jede Authentifizierung
     erreichbar (Punkt 6 oben gilt unverändert, `NET`/`ACTION`/`CAL IMPORT`
     eingeschlossen).
-13. **`TESTSHOOT` (5.7/7.7) erzeugt reguläre `shot`/`reject`-Telegramme** -
+13. **`TESTSHOOT` (5.7/7.7) erzeugt reguläre `shot`/`reject`-Telegramme**
+    (ein `reject` davon bei `SENDREJECT=0` also nur auf Serial) -
     ein Stand-PC, der jede Auslösung automatisch in eine Wertung übernimmt,
     **muss** auf das zusätzliche Feld `"synthetic":1` prüfen und solche
     Zeilen davon ausschließen (bei echten Schüssen fehlt das Feld komplett,

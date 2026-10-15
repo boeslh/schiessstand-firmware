@@ -7,7 +7,7 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
 `docs/remote-interaktion-konzept.md` im selben Repo).
 
 - Firmware-Datei: `src/schiessstand_firmware.ino`
-- Firmware-Version zum Zeitpunkt dieser Doku: **4.12.1**
+- Firmware-Version zum Zeitpunkt dieser Doku: **4.17.0**
 - Bei Abweichungen zwischen diesem Dokument und dem Quellcode gilt der
   Quellcode als maßgeblich.
 - Rev 4.9.0 hat die erste Umsetzungsstufe aus
@@ -29,6 +29,45 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
   `SET`-Befehl; `CLUSTERCORR=0` + `CLUSTERITER=0` + `LSQ=0` stellt das
   bisherige Verhalten exakt wieder her. Außerdem trägt jetzt auch die
   `config`-Antwort auf `SHOW #<id>` das `corr`-Feld (siehe 2).
+- Rev 4.13.0 hat `SET CAPTURE=ISR|MCPWM` ergänzt (Default `ISR` = bisheriges
+  Verhalten): Zeitstempel der Luft-Mics optional per MCPWM-Hardware-Capture
+  statt GPIO-Interrupt, siehe 5.2 und 7.1. Neue Felder `capture` in `status`
+  (aktiver Modus, plus `cap_*`-Diagnose) und `config` (eingestellter Modus).
+  Telegramm-Formate und Zeitbezüge (`air_ns` usw.) bleiben unverändert.
+- Rev 4.14.0 hat die Pulsbreiten-Korrektur ergänzt (`SET WALKK`/`WALKCAL`/
+  `WALKMAX`, Default `WALKK=0` = aus, nur mit `CAPTURE=MCPWM` wirksam) -
+  gleicht die amplitudenabhängige Auslöseverzögerung der Komparatoren aus,
+  siehe 5.2 und 7.1. Neu: Feld `air_w_ns` in `shot` (nur bei aktivem MCPWM),
+  `walk_k`/`walk_fitted` in `cal`/`done`, `walk_*` in `config`.
+- Rev 4.15.0 hat `SET DHT=0|1` ergänzt (Default 0): Schallgeschwindigkeit aus
+  Temperatur/Luftfeuchte eines DHT22 an GPIO15, siehe 5.2 und 7.2.
+  `SET SOUNDSPEED` gilt als Ersatzwert weiter, jetzt mit Nachkommastelle und
+  neuem Default 342.5 (nur bei leerem NVS bzw. nach `CAL RESET`). Neue Felder:
+  `status`: `sound_act_mps`, `sound_src`, bei `DHT=1` `temp_c`/`rh_pct`/
+  `dht_age_s`/`dht_err`; `config`: `sound_set_mps`, `dht`; `cal`/`done`:
+  `sound_set_mps`, `sound_act_mps`. **`sound_mps` bleibt eine gerundete
+  Ganzzahl** (Kompatibilität) - für den genauen Wert `sound_set_mps` lesen.
+- Rev 4.16.0: neues optionales Telegramm `raw` (`SET RAWLOG=1`, Default 0) mit
+  allen unkorrigierten Flanken und den aktiven Parametern zu jedem gültigen
+  Schuss - für den Server-Simulator, siehe 4.5c. `shot` trägt jetzt
+  `sound_act_mps`. Der Offline-Puffer (3.7) fasst jetzt 32 Zeilen à 1024 Byte
+  statt 64 à 360 - lange `shot`-Zeilen wurden vorher beim Puffern
+  abgeschnitten. Abgelehnte Schüsse verhalten sich unverändert.
+- Rev 4.16.1 (Bugfix): Sendepuffer vergrößert, weil Telegramme abgeschnitten
+  wurden - `config` (Antwort auf `SHOW`, typisch ~1000, max. ~1230 Zeichen)
+  jetzt 1536 statt 900 Byte, `shot` 1024 statt 900 Byte, Offline-Puffer
+  1024 Byte + Signatur-Präfix je Zeile. Felder und Formate unverändert. Ein
+  Host sollte trotzdem mit Zeilen bis mindestens 2 KB (`config`) bzw. 2,6 KB
+  (`raw`) rechnen.
+- Rev 4.17.0: **Zonen-Kalibrierung** (nur `ALGO=CLASSIC`, Default aus): je
+  Bereich der Scheibe ein eigener Satz aus Schallgeschwindigkeit, `OFS0-5` und
+  `OFFSETX/Y` - A = im Loch der Vorsatzscheibe (nur Schussband), B = neben dem
+  Band (nur Vorsatzscheibe), C = Band + Vorsatzscheibe. Neue Befehle
+  `SET ZONES/ZHOLE/ZBAND/ZBLEND/ZCAL` (5.2) und `SHOWZONES` (5.1, Telegramm
+  `zones`, 4.3b), neue Felder `zones`/`z_hole_um` in `config` und `zone` in
+  `shot`. Ablauf siehe 7.3c. `CAL RESET` verwirft auch die Zonen-Sätze.
+  Werks-Defaults (nur bei leerem NVS): `RADIUS` 4000 statt 200 (0,2 mm war
+  ein Einheitenfehler), `BSHIFTPCT` 30 statt 40.
 
 ---
 
@@ -137,10 +176,12 @@ kann. Beschreibt den **Ist-Zustand**, keine geplanten Erweiterungen (dafür sieh
    TCP-Verbindung auf seiner (Server-)Seite.
 7. **Sendepuffer bei Verbindungsverlust:** Während die TCP-Verbindung fehlt,
    werden **ausschließlich** `shot`- und `reject`-Telegramme in einem
-   Ringpuffer (`TXBUF_SLOTS=64` Zeilen à max. `TXBUF_LINE=320` Byte)
+   Ringpuffer (`TXBUF_SLOTS=32` Zeilen à max. `TXBUF_LINE=1024` Byte inkl.
+   Signatur-Präfix; bis Rev 4.15: 64 à 360 - längere `shot`-Zeilen wurden
+   dabei abgeschnitten)
    zwischengespeichert; alle anderen Telegrammtypen (`status`, `config`,
    `cal`, ...) gehen bei fehlender Verbindung **verloren**, nicht gepuffert.
-   Läuft der Puffer bei anhaltender Trennung über 64 Zeilen hinaus, wird die
+   Läuft der Puffer bei anhaltender Trennung über 32 Zeilen hinaus, wird die
    jeweils älteste verworfen (reines Ringpuffer-Überschreiben, kein
    Fehlertelegramm dafür). Bei Wiederverbindung wird der komplette Puffer
    **vor** der nächsten Live-Zeile ausgeliefert (Reihenfolge bleibt erhalten,
@@ -183,7 +224,16 @@ wenn er es regelmäßig braucht.
 ```json
 {"type":"status","version":"4.9.0","mac":"AA:BB:CC:DD:EE:FF","lane":1,
  "uptime_s":12345,"shots":42,"window_ms":1,"debounce_ms":100,"mics":6,
- "buffered":0,"test_mode":0}
+ "buffered":0,"test_mode":0,"capture":"isr",
+ "sound_act_mps":343.85,"sound_src":"dht","temp_c":20.0,"rh_pct":50.0,
+ "dht_age_s":12,"dht_err":0}
+```
+
+Bei aktivem MCPWM-Capture (siehe `capture`):
+
+```json
+{..., "test_mode":0,"capture":"mcpwm","cap_sync_ns":-120,"cap_check_ns":85,
+ "cap_reanchor":0}
 ```
 
 | Feld | Typ | Bedeutung |
@@ -198,8 +248,38 @@ wenn er es regelmäßig braucht.
 | `mics` | int | Anzahl Luft-Mikrofonkanäle (Hardware-Konstante, aktuell immer 6) |
 | `buffered` | uint | Anzahl aktuell im Reconnect-Ringpuffer wartender `shot`/`reject`-Zeilen (siehe 3.7) |
 | `test_mode` | 0/1 | ob `SET TESTMODE=1` aktiv ist |
+| `capture` | `"isr"`\|`"mcpwm"` | **seit Rev 4.13.0**: **tatsächlich aktive** Zeitstempel-Erfassung der Luft-Mics. Kann trotz `SET CAPTURE=MCPWM` `"isr"` sein, wenn die MCPWM-Initialisierung beim Boot fehlschlug (Grund steht in der seriellen Boot-Ausgabe) |
+| `cap_sync_ns` | int | nur bei `capture:"mcpwm"`: Boot-Prüfung des Gruppen-Syncs (Soft-Catch Gruppe 1 gegen Anker aus Gruppe 0). Der Wert ist die Differenz zweier Callback-Latenzen, normal also nahe 0 (Betrag typ. < 2000). Bei mehr als ±20000 wäre der Boot auf ISR zurückgefallen |
+| `cap_check_ns` | int | nur bei `capture:"mcpwm"`: letzte Gegenprüfung der Zeitbasis (alle 10 s in Ruhephasen). Ebenfalls Differenz zweier Callback-Latenzen, normal nahe 0 (Betrag typ. < 2000) und ohne Trend über die Betriebszeit |
+| `sound_act_mps` | float (m/s) | **seit Rev 4.15.0**: aktuell für die Auswertung verwendete Schallgeschwindigkeit |
+| `sound_src` | `"dht"`\|`"fixed"` | **seit Rev 4.15.0**: `"dht"` = aus der DHT22-Messung berechnet, `"fixed"` = `SET SOUNDSPEED` (bei `DHT=0`, vor der ersten gültigen Messung oder wenn die letzte gültige Messung älter als 5 min ist) |
+| `temp_c`,`rh_pct` | float oder `null` | nur bei `SET DHT=1`: gefilterte Messwerte (Median der letzten 3 gültigen Messungen), `null` = noch keine gültige Messung |
+| `dht_age_s` | uint | nur bei `SET DHT=1` und gültiger Messung: Sekunden seit der letzten gültigen Messung (Messabstand 30 s) |
+| `dht_err` | uint | nur bei `SET DHT=1`: fehlgeschlagene/verworfene Messungen seit Boot (Prüfsumme, Timeout, unplausibel). Einzelne Fehler sind normal (Interrupts während des Auslesens), ein stetig steigender Wert ohne `temp_c` deutet auf Verkabelung/Sensor |
+| `cap_reanchor` | uint | nur bei `capture:"mcpwm"`: wie oft die Zeitbasis wegen einer Abweichung > 50 µs neu verankert wurde. Soll 0 bleiben - steigt der Wert, bitte melden |
 
 Verbindungsstatus (WLAN/TCP) ist **nicht** hier, sondern in `confignet` (4.4).
+
+### 4.3b `zones` — Zonen-Kalibrierung (seit Rev 4.17.0)
+
+Gesendet: auf `SHOWZONES`. Eigene Zeile, damit `config` nicht weiter wächst.
+
+```json
+{"type":"zones","mac":"AA:BB:CC:DD:EE:FF","zones":1,"active":1,
+ "z_hole_um":15250,"z_band_um":45000,"z_blend_um":2250,
+ "a":{"sound_mps":336.9,"mic_offset_ns":[0,1371,-10627,-4091,-6309,-641],
+      "offset_x_um":-845,"offset_y_um":-2577},
+ "b":null,
+ "c":{"sound_mps":348.9,"mic_offset_ns":[0,-2192,-6494,-4316,-7408,-5993],
+      "offset_x_um":208,"offset_y_um":1365}}
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `zones` | `SET ZONES` (eingeschaltet) |
+| `active` | 1 = Zonen wirken tatsächlich (`ZONES=1`, `ZHOLE>0` und `ALGO=CLASSIC`) |
+| `z_hole_um`, `z_band_um`, `z_blend_um` | Grenzen, siehe `SET ZHOLE/ZBAND/ZBLEND` |
+| `a`, `b`, `c` | Satz der Zone oder `null` (= Zone nutzt die Basiswerte `SOUNDSPEED`/`OFS<i>`/`OFFSETX/Y`) |
 
 ### 4.3 `config` — Auswertungs-/Betriebsparameter
 
@@ -215,9 +295,11 @@ Gesendet: auf `SHOW`-Befehl, und automatisch am Ende von `CAL START`
  "standoff_paper_mm":28.00,
  "mic_half_x_mm":115.00,"bullet_shift_pct":40,"bullet_shift_cap_mm":3.00,
  "cluster_corr":1,"cluster_iter":5,"lsq":0,"lsq_pellet_r_mm":2.25,
- "algo":"classic","pellet_r_mm":2.25,"max_sigma_um":2000,
+ "algo":"classic","pellet_r_mm":2.25,"max_sigma_um":2000,"capture":"isr",
+ "walk_k":0.000,"walk_cal":0,"walk_max_us":150,
  "use_piezo":1,"piezo_req":1,"piezo_min_us":100,"piezo_max_us":1400,
  "test_cooldown_ms":3000,"offset_x_um":0,"offset_y_um":0,"sound_mps":343,
+ "sound_set_mps":342.5,"dht":0,"raw_log":0,"zones":0,"z_hole_um":0,
  "paper_feed_mm":50.00,"paper_speed_mmps":5.00,"paper_auto":1,
  "paper_trigger":"piezo","paper_dir_invert":1,"paper_jog_speed_mmps":75.00}
 ```
@@ -317,12 +399,16 @@ Stand-PC-Seite):
 | `seq` | uint | fortlaufende Sequenznummer, beginnt bei 1 nach Boot oder `RESET`-Befehl, **überläuft nicht in der Praxis** (uint32). Bei `SET SENDREJECT=0` (Default) zählen nur `shot`-Telegramme, bei `SENDREJECT=1` alle Auslösungen (shot+reject zusammen) |
 | `algo` | `"classic"` oder `"rim"` | **seit Rev 4.11.0**, siehe oben bei `reject` und 4.5b |
 | `air_ns` | Array[6] von Arrays | **nur bei `algo:"classic"`** (siehe 4.5b für `algo:"rim"`): pro Mikrofonkanal (Index = Kanal, siehe 7.1) alle erfassten Flankenzeiten in ns relativ zum ersten Ereignis des Fensters (`firstAirCC`); leeres Array `[]` = Kanal hat in diesem Fenster nicht ausgelöst; **erste Flanke pro Kanal** (`air_ns[i][0]`) ist die für die Positionslösung verwendete Zeit; weitere Flanken (Nachschwinger/Mehrfachtrigger) sind rein informativ |
+| `air_w_ns` | Array[6] von int oder `null` | **seit Rev 4.14.0, nur bei aktivem MCPWM-Capture** (`status.capture:"mcpwm"`, sonst fehlt das Feld): Pulsbreite der ersten Flanke je Kanal in ns = Zeit, die das Mic-Signal über der Komparatorschwelle blieb (Maß für die Amplitude). `null` = keine plausible fallende Flanke (z.B. Breite > `WALKMAX`). Grundlage der `WALKK`-Korrektur; `air_ns` selbst bleibt **unkorrigiert** (Rohzeiten) |
 | `x_um_pre`,`y_um_pre`,`precision_um_pre`,`cluster_hits_pre` | — | **nur bei `SET DEBUG=3`**: Roh-Position vor dem Verifizierungsschritt (siehe 7.3), zum Vergleich mit dem finalen Ergebnis |
 | `x_um`,`y_um` | int (0.001 mm) | finale Trefferposition im Zielkoordinatensystem (Ursprung = Scheiben-/Plattenzentrum, siehe 7.2), inkl. `SET OFFSETX/OFFSETY`-Nachkorrektur |
 | `pos_res_um` | int (0.001 mm) | Rest-Fehler der gewählten Stufe-1-Dreier-Kombination gegen die nicht beteiligten Mikrofone - Maß für Konsistenz der Rohmessung (siehe 7.3), **unbeeinflusst** von `OFFSETX/OFFSETY` |
 | `precision_um` | int (0.001 mm) | RMS-Streuung der (bis zu 2) nächstgelegenen weiteren Kandidatenlösungen um das finale Ergebnis - je kleiner, desto übereinstimmender die verschiedenen Mikrofon-Kombinationen |
 | `cluster_hits` | int | Anzahl Kandidatenlösungen innerhalb `SET RADIUS` um die finale Position |
 | `pos_valid` | 0/1 | ob überhaupt eine geometrische Lösung gefunden wurde (bei ≥3 Mics fast immer 1) |
+| `sound_act_mps` | float (m/s) | **seit Rev 4.16.0**: für diesen Schuss verwendete Schallgeschwindigkeit (bei `SET DHT=1` aus der Messung, ändert sich daher über die Zeit) |
+| `raw_follows` | 0/1 | **seit Rev 4.16.0**: 1 = als **unmittelbar nächste Zeile** folgt ein `raw`-Telegramm mit derselben `seq` (siehe 4.5c) - der Host kann mit der Anzeige darauf warten. 0 bei `RAWLOG=0` oder wenn dieser `shot` mangels TCP-Verbindung im Offline-Puffer landet (das `raw` wird nicht gepuffert und käme beim Nachliefern nie an) |
+| `zone` | `"A"`/`"B"`/`"C"` | **seit Rev 4.17.0**, nur bei aktiver Zonen-Kalibrierung: Zone mit dem größten Anteil an der Lage (7.3c). `x_um`/`y_um` sind dann bereits mit den Zonen-Sätzen gerechnet, `pos_res_um`/`precision_um`/`cluster_hits` stammen aus der Rechnung dieser Zone |
 | `piezo_ns` | int oder `null` | wie bei `reject`, nur wenn `SET PIEZO=1` |
 | `piezo_ok` | 0/1 | nur wenn `SET PIEZO=1`: ob die Piezo-Verzögerung im erwarteten Fenster (`PIEZOMIN`..`PIEZOMAX`) lag |
 | `clean` | 0/1 | **zusammenfassendes Gütekriterium**, siehe Formel unten - der Stand-PC kann sich hierauf verlassen, statt die Schwellenlogik selbst nachzubilden |
@@ -359,11 +445,13 @@ definiert oder entfallen/kommen neu hinzu:
 | Feld | Typ | Bedeutung |
 |---|---|---|
 | `air_ns` | Array[6] von Arrays | wie bei `algo:"classic"`, aber die Zeiten sind relativ zum **Piezo** (nicht zur ersten Flanke) und können **negativ** sein (Ereignis vor dem Piezo, der Regelfall); enthält alle innerhalb des Gate-Zeitfensters `[-PIEZOMAX, +postWait]` erfassten Kandidatenflanken, nicht nur die erste - der Löser wählt selbst die passende aus |
+| `air_w_ns` | Array[6] von int oder `null` | wie bei `algo:"classic"` (nur bei aktivem MCPWM), hier die Pulsbreite der jeweils **ersten** Kandidatenflanke in `air_ns[i]`. Achtung: bei `algo:"rim"` sind die `air_ns`-Zeiten offset- **und** (bei `WALKK>0`) pulsbreiten-korrigiert |
 | `x_um`,`y_um` | int (0.001 mm) | wie bei `algo:"classic"`, inkl. `SET OFFSETX/OFFSETY` |
 | `sigma_x_um`,`sigma_y_um` | int (0.001 mm) | **ersetzt `precision_um`/`cluster_hits`**: 1-Sigma-Unsicherheit aus der Kovarianzmatrix der Ausgleichsrechnung - der wahre Wert liegt mit ca. 68% Wahrscheinlichkeit innerhalb ±1σ, mit ca. 99% innerhalb ±2σ je Achse |
 | `rms_ns` | float | RMS der Zeit-Residuen der verwendeten Mikrofone (Diagnose, Gegenstück zu `pos_res_um`) |
 | `t0_ns` | float | geschätzter Einschlagzeitpunkt relativ zum Piezo (typisch negativ - das Piezo löst planmäßig nach dem Einschlag aus) |
 | `used_mask` | uint (Bitmaske) | Bit `i` gesetzt = Mikrofon `i` ging in die finale Lösung ein (Inlier) |
+| `sound_act_mps`, `raw_follows` | | **seit Rev 4.16.0**, wie bei `algo:"classic"` |
 | `pos_res_um`,`precision_um`,`cluster_hits`,`piezo_ns`,`piezo_ok` | — | **entfallen bei `algo:"rim"`** (kein Feld im Telegramm) - das Piezo ist hier immer der Trigger selbst, eine gesonderte Verzögerungsprüfung entfällt |
 | `clean` | 0/1 | bei `algo:"rim"`: `pos_valid AND max(sigma_x_um,sigma_y_um) <= max_sigma_um` (`SET MAXSIGMA`, siehe 5.2) - **andere Formel** als bei `algo:"classic"` (dortige Formel bleibt unverändert gültig für `algo:"classic"`) |
 
@@ -372,6 +460,64 @@ Ablaufreihenfolge unterscheidet sich ebenfalls: es gibt kein festes
 von der Geometrie/Schallgeschwindigkeit abhängige Wartezeit verstrichen ist
 (nicht separat konfigurierbar). `PAPERTRIGGER=ANY` und `=PIEZO` verhalten
 sich bei `algo:"rim"` identisch (das Piezo triggert immer).
+
+#### 4.5c `raw` — Rohdaten für den Simulator (seit Rev 4.16.0, `SET RAWLOG=1`)
+
+Nur bei `SET RAWLOG=1` (Default 0) und **nur zu gültigen Schüssen**: direkt
+nach dem `shot`-Telegramm folgt eine `raw`-Zeile mit **derselben `seq`**.
+Ob eine folgt, zeigt das Feld `raw_follows` im `shot`. Empfehlung für den
+Host: bei `raw_follows:1` auf die nächste Zeile warten, aber mit einem kurzen
+Timeout (z.B. 500 ms) - bricht die Verbindung genau zwischen beiden Zeilen
+ab, kommt das `raw` nicht mehr.
+Abgelehnte Schüsse erzeugen kein `raw` (Reject-Verhalten unverändert).
+Enthält alle steigenden und fallenden Flanken aus den Ringpuffern der
+Firmware in einem Fenster um den Schuss - **unkorrigiert** (kein Offset,
+keine Pulsbreiten-Korrektur) und ohne die Fenster-/Anzahl-Grenzen der
+Auswertung - plus die zum Schusszeitpunkt aktiven Parameter. Damit lässt
+sich jeder Schuss im Simulator mit beiden Auswertepfaden und beliebigen
+Parametern nachrechnen.
+
+```json
+{"type":"raw","seq":44,"algo":"classic","ref":"first","capture":"mcpwm",
+ "sound_act_mps":343.85,"walk_k":0.500,"walk_max_us":150,
+ "win_pre_ns":1450000,"win_post_ns":1600000,
+ "ofs_ns":[0,-1234,880,312,-95,40],"mic_en":[1,1,1,1,1,1],"piezo_ns":1180000,
+ "rise_ns":[[0],[816667],[930000],[1200000],[1500000],[-38200,1650000]],
+ "fall_ns":[[40000],[856667],[970000],[1240000],[1540000],[1689000]],
+ "truncated":0,"ts":123456}
+```
+
+| Feld | Typ | Bedeutung |
+|---|---|---|
+| `seq` | uint | identisch zum unmittelbar vorausgehenden `shot` |
+| `algo` | `"classic"`\|`"rim"` | Pfad, der den Schuss ausgewertet hat |
+| `ref` | `"first"`\|`"piezo"` | Zeitnullpunkt aller `*_ns`-Werte: `"first"` (CLASSIC) = erste Flanke des Sammelfensters, identisch zu `air_ns` im `shot`; `"piezo"` (RIM) = Piezo-Flanke |
+| `capture` | `"isr"`\|`"mcpwm"` | aktive Erfassung. Bei `"isr"` sind die `fall_ns`-Listen immer leer |
+| `sound_act_mps`, `walk_k`, `walk_max_us`, `ofs_ns`, `mic_en` | | zum Schusszeitpunkt aktive Werte (`ofs_ns`/`mic_en` je Kanal, Index wie 7.1) |
+| `win_pre_ns`, `win_post_ns` | int (ns) | Fenster relativ zum Nullpunkt. **RIM:** genau das Kandidatenfenster der Auswertung. **CLASSIC:** Sammelfenster plus Vorlauf `PIEZOMAX+50µs`; die Auswertung selbst nutzte je Kanal nur die erste Flanke ab 0 innerhalb von `tdoa_us` (`SET TDOA`, aus `config`) - Flanken vor 0 sind rein informativ (z.B. während der Sperrzeit verworfene) |
+| `piezo_ns` | int oder `null` | Piezo relativ zum Nullpunkt (RIM immer 0) |
+| `rise_ns` | Array[6] von Arrays | steigende Flanken (= Auslösungen) je Kanal, aufsteigend, aus `[-win_pre_ns, win_post_ns + 500000]`. Die 20-µs-Totzeit der Firmware ist bereits angewandt |
+| `fall_ns` | Array[6] von Arrays | fallende Flanken je Kanal, gleiches Fenster. Preller < 2 µs sind zur jeweils letzten Flanke zusammengefasst |
+| `truncated` | 0/1 | 1 = mehr als 16 Flanken einer Art bei mindestens einem Kanal, es wurden nur die ersten 16 gesendet |
+| `ts` | uint64 (ms) | wie bei `shot` |
+| `synthetic` | 1 | nur bei `TESTSHOOT` |
+
+**Nachrechnen im Simulator** (identisch zur Firmware):
+- CLASSIC: je Kanal die erste Flanke aus `rise_ns` mit `0 ≤ t ≤ tdoa_us`;
+  RIM: alle Flanken mit `−win_pre_ns ≤ t − ofs_ns[i] ≤ win_post_ns`, davon die
+  ersten 8 je Kanal. Offset abziehen: `t − ofs_ns[i]`. Kanäle mit
+  `mic_en = 0` ignorieren.
+- Pulsbreite einer steigenden Flanke `r`: letzte fallende Flanke `f` mit
+  `r < f < min(nächste steigende Flanke desselben Kanals, r + walk_max_us)`,
+  Breite `f − r`; kürzer als 300 ns oder keine solche Flanke = ungültig.
+- Pulsbreiten-Korrektur: `t += walk_k · (w − w̄)`, `w̄` = Mittel der gültigen
+  Breiten der verwendeten Flanken dieses Schusses (CLASSIC: erste Flanke je
+  Kanal; RIM: jeweils früheste Kandidatenflanke je Kanal), ungültig = keine
+  Korrektur. RIM: danach je Kanal neu sortieren.
+
+`raw` wird **nicht** im Offline-Puffer (3.7) gehalten - bei fehlender
+TCP-Verbindung geht es nur über Serial raus. Länge typisch 400-600, maximal
+etwa 2000 Zeichen.
 
 #### `cand` — Kandidaten-Debug (nur `SET DEBUG=3`)
 
@@ -398,7 +544,7 @@ Auslösung, während eine Kalibrierung läuft (`calActive`). Fünf `state`-Werte
 | `"start"` | direkt nach `CAL START` | `need` (= `SET CALSHOTS`) |
 | `"waiting"` | nach jeder für die Kalibrierung verwertbaren Auslösung, solange noch nicht genug gesammelt | `progress`, `need` |
 | `"skipped"` | eine Auslösung während `calActive` war **nicht verwertbar** (<3 Mics, oder bei `SET PIEZO=1` fehlende/unplausible Piezo-Bestätigung) - zählt nicht zum Fortschritt | `reason` (`"only <n> mic(s)"` oder `"no piezo confirmation"`), `progress`, `need` |
-| `"done"` | Zielzahl (`need`) erreicht - Kalibrierung abgeschlossen, Offsets **automatisch ins NVS geschrieben** | `mac` (seit Rev 4.9.0, wie bei `status`), `offsets_ns` (Array[6], ns), `sound_mps` (aktueller Wert, **nicht** durch die Kalibrierung verändert - siehe 7.4), `shots` (= Anzahl verwendeter Schüsse). **Direkt danach folgt automatisch ein volles `config`-Telegramm (4.3)** in derselben Verbindung. Für einen Stand-PC-seitigen Kalibrierungs-Speicher (siehe Konzept Abschnitt 7.1) genügt es, auf dieses Telegramm zu lauschen und `offsets_ns`/`sound_mps` zusammen mit `mac` abzulegen - kein separater Upload-Befehl nötig. Restore siehe `CAL IMPORT` (5.3). |
+| `"done"` | Zielzahl (`need`) erreicht - Kalibrierung abgeschlossen, Offsets **automatisch ins NVS geschrieben** | `mac` (seit Rev 4.9.0, wie bei `status`), `offsets_ns` (Array[6], ns), `sound_mps` (`SET SOUNDSPEED` ganzzahlig gerundet, **nicht** durch die Kalibrierung verändert - siehe 7.4), `sound_set_mps` (seit Rev 4.15.0: derselbe Wert genau), `sound_act_mps` (seit Rev 4.15.0: während der Kalibrierung aktive Schallgeschwindigkeit, bei `DHT=1` aus der Messung), `walk_k` (seit Rev 4.14.0: aktueller `SET WALKK`), `walk_fitted` (1 = `walk_k` wurde in diesem Lauf mitbestimmt und gespeichert, nur bei `WALKCAL=1` und aktivem MCPWM), `shots` (= Anzahl verwendeter Schüsse). **Direkt danach folgt automatisch ein volles `config`-Telegramm (4.3)** in derselben Verbindung. Für einen Stand-PC-seitigen Kalibrierungs-Speicher (siehe Konzept Abschnitt 7.1) genügt es, auf dieses Telegramm zu lauschen und `offsets_ns`/`sound_mps` zusammen mit `mac` abzulegen - kein separater Upload-Befehl nötig. Restore siehe `CAL IMPORT` (5.3). |
 | `"aborted"` | nach `CAL ABORT` | — |
 
 `CAL STATUS` liefert zusätzlich außerhalb des laufenden Sammelvorgangs:
@@ -458,6 +604,7 @@ siehe Abschnitt 4.
 |---|---|
 | `SHOW` | `config`-Telegramm (4.3) |
 | `SHOWNET` | `confignet`-Telegramm (4.4) |
+| `SHOWZONES` | `zones`-Telegramm (4.3b), seit Rev 4.17.0 |
 | `STATUS` | `status`-Telegramm (4.2) |
 | `PING` | `pong` (4.8) |
 | `HELP` oder `?` | **nur über Serial**, mehrzeiliger Klartext-Hilfetext (kein JSON, wird nicht über `emitLine` gesendet - **kommt beim TCP-Client nicht an**, dort keine Reaktion) |
@@ -480,14 +627,14 @@ Werte case-sensitiv.
 | `WINDOW` | 1-50 (ms) | 1 | – | Mindest-Sammelfenster (wird bei aktivem Piezo automatisch bis `PIEZOMAX+200µs` verlängert). Nur `ALGO=CLASSIC` - bei `ALGO=RIM` wirkungslos, siehe 4.5b |
 | `DEBUG` | 0-3 | 0 | – | 3 = zusätzliche `cand`/`*_pre`-Diagnosefelder; `shot`/`reject` selbst gehen unabhängig davon raus (`reject` per TCP nur bei `SENDREJECT=1`) |
 | `OUTLIER` | 0-500000 (0.001mm) | 5000 | – | Schwelle für `pos_res_um` in `clean`-Bewertung (nur `ALGO=CLASSIC`) |
-| `RADIUS` | 0-500000 (0.001mm) | 200 | – | Umkreis für `cluster_hits` und Verifizierungs-Mittelpunkt (nur `ALGO=CLASSIC`) |
+| `RADIUS` | 0-500000 (0.001mm) | 4000 (bis Rev 4.16: 200) | – | Umkreis für `cluster_hits` und Verifizierungs-Mittelpunkt (nur `ALGO=CLASSIC`) |
 | `MINCLUSTER` | 0-20 | 2 | – | Mindest-`cluster_hits` für `clean` (nur `ALGO=CLASSIC`) |
 | `MAXPRECISION` | 0-500000 (0.001mm) | 2000 | – | Max. `precision_um` für `clean` (nur `ALGO=CLASSIC`) |
 | `MINMICS` | 3-6 | 5 | – | Mindestzahl Mics, sonst `reject` |
 | `TDOA` | 100-5000 (µs) | 750 | – | Geometrie-Plausibilitätsfenster (ISR-Ebene). Nur `ALGO=CLASSIC` - bei `ALGO=RIM` wirkungslos (Gate ergibt sich aus `PIEZOMIN/MAX`, siehe 4.5b) |
 | `STANDOFFPAPER` | 5.0-100.0 (mm) | 28.0 | – | Mic-Standoff (rechtwinklig zur Scheibe) |
 | `MICHALFX` | 5.0-300.0 (mm) | 115.0 | – | horizontaler Mic-Abstand zur Mittellinie |
-| `BSHIFTPCT` | 0-100 (%) | 40 | – | Kugeldurchmesser-Korrektur, 0=aus (nur `ALGO=CLASSIC`) - seit Rev 4.11.4 Teil der `CAL START`-Kostenfunktion, siehe 7.4 |
+| `BSHIFTPCT` | 0-100 (%) | 30 (bis Rev 4.16: 40) | – | Kugeldurchmesser-Korrektur, 0=aus (nur `ALGO=CLASSIC`) - seit Rev 4.11.4 Teil der `CAL START`-Kostenfunktion, siehe 7.4 |
 | `BSHIFTCAP` | 0.0-20.0 (mm) | 3.0 | – | Kappung der Korrektur je Mikrofon (nur `ALGO=CLASSIC`) |
 | `CLUSTERCORR` | 0/1 | 1 | – | **seit Rev 4.12.0**: 1 = alle Schnittpunkte werden vor der Mittelung in Stufe 2 kugeldurchmesser-korrigiert (`BSHIFTPCT`/`BSHIFTCAP`, wirkungslos bei `BSHIFTPCT=0`); 0 = nur die Stufe-1-Lösung (Verhalten bis 4.11.5). Bei 1 beziehen sich `cluster_hits`/`precision_um` auf die korrigierten Punkte. Nur `ALGO=CLASSIC`, siehe 7.3 |
 | `CLUSTERITER` | 0-10 | 5 | – | **seit Rev 4.12.0**: zusätzliche Durchgänge, in denen der `RADIUS`-Cluster um den jeweils neuen Mittelpunkt neu gebildet wird (Mean-Shift, Abbruch sobald stabil); 0 = einmalig um die Stufe-1-Lösung (bis 4.11.5). Nur `ALGO=CLASSIC` |
@@ -497,6 +644,10 @@ Werte case-sensitiv.
 | `PELLETR` | 0.0-10.0 (mm) | 2.25 | – | Lochrand-Radius für `ALGO=RIM` (0=Punktquelle) |
 | `MAXSIGMA` | 0.0-50.0 (mm) | 2.0 | – | `clean`-Schwelle für `ALGO=RIM` (max. 1-Sigma-Unsicherheit) |
 | `PIEZO` | 0\|1 | 1 | – | Piezo als Trigger-Bestätigung nutzen |
+| `CAPTURE` | `ISR`\|`MCPWM` | `ISR` | ✅ | **seit Rev 4.13.0**: Zeitstempel der Luft-Mics. `ISR` = GPIO-Interrupt + CPU-Zykluszähler (bisher, Interrupt-Latenz-Jitter ~1-3 µs); `MCPWM` = Hardware-Capture (12,5 ns Auflösung, kein Interrupt-Jitter, GPIO23 muss unbeschaltet bleiben, siehe 7.1). Wirkt in beiden `ALGO`-Pfaden. Nach dem Umschalten `CAL RESET` + neue `CAL START`-Serie, da die alten `OFS`-Werte die ISR-Latenz mit einkalibriert haben. Aktiver Modus: `status.capture` |
+| `WALKK` | 0.0-1.0 | 0.0 | – | **seit Rev 4.14.0**: Amplituden-Korrektur über die Pulsbreite, siehe 7.1. Je Mic `t += WALKK·(w − w̄)` mit `w` = Pulsbreite (`air_w_ns`), `w̄` = Mittel der gültigen Breiten dieses Schusses. 0 = aus, 0.5 = Pulsmitte (für eine symmetrische Halbwelle amplitudenunabhängig). Wirkt sofort, aber **nur bei aktivem `CAPTURE=MCPWM`** (sonst `warn` in der `ok`-Antwort), in beiden `ALGO`-Pfaden |
+| `WALKCAL` | 0/1 | 0 | – | **seit Rev 4.14.0**: 1 = `CAL START` bestimmt `WALKK` zusammen mit den Offsets (Start beim aktuellen Wert) und speichert ihn |
+| `WALKMAX` | 5-500 (µs) | 150 | – | **seit Rev 4.14.0**: größte plausible Pulsbreite; längere gelten als ungültig (`null`), das Mic bleibt dann unkorrigiert |
 | `PIEZOREQ` | 0/1 | 1 | – | nur wirksam bei `PIEZO=1` und `ALGO=CLASSIC`: 1 = Schuss ohne gültige Piezo-Bestätigung wird `reject` (siehe 4.5, Schritt 3b), 0 = `shot` mit `piezo_ok:0`/`clean:0` |
 | `PIEZOMIN` | 0-5000 (µs) | 100 | – | Min. erwartete Piezo-Verzögerung nach dem ersten Luft-Ereignis |
 | `PIEZOMAX` | 0-5000 (µs) | 1400 | – | Max. erwartete Piezo-Verzögerung / Ausreißer-Obergrenze |
@@ -504,7 +655,14 @@ Werte case-sensitiv.
 | `TESTCOOLDOWN` | 0-10000 (ms) | 3000 | – | Mindestabstand ident. Meldungen im Testmodus |
 | `OFFSETX` | -50000..50000 (0.001mm) | 0 | – | konstanter Nachkorrektur-Offset x |
 | `OFFSETY` | -50000..50000 (0.001mm) | 0 | – | wie `OFFSETX`, y |
-| `SOUNDSPEED` | 300-400 (m/s) | 343 | – | **rein manuell**, wird von `CAL START` NICHT verändert |
+| `SOUNDSPEED` | 300.0-400.0 (m/s) | 342.5 | – | Schallgeschwindigkeit bei `DHT=0` bzw. ohne gültige Messung. Seit Rev 4.15.0 mit Nachkommastelle, Default 342.5 (bis 4.14: Ganzzahl, Default 343 - ein gespeicherter Wert bleibt beim Update erhalten). **Rein manuell**, wird von `CAL START` NICHT verändert. Antwort enthält zusätzlich `active_mps` |
+| `ZONES` | 0/1 | 0 | – | **seit Rev 4.17.0**: Zonen-Kalibrierung an (wirkt nur mit `ZHOLE>0` und `ALGO=CLASSIC`), siehe 7.3c. Antwort `{"type":"ok","set":"zones","value":1,"active":1}` |
+| `ZHOLE` | 0–60000 | 0 | 0.001 mm | **seit Rev 4.17.0**: Radius des Lochs der Vorsatzscheibe (Zone A). LG 15250 (Ø 30,5 mm), LP 29750 (Ø 59,5 mm) - der Stand-PC setzt den Wert beim Scheibenwechsel je Scheibentyp. 0 = Zonen wirkungslos |
+| `ZBAND` | 0–100000 | 45000 | 0.001 mm | **seit Rev 4.17.0**: halbe Breite des Schussbands (Grenze Zone B/C bei \|x\| = `ZBAND`) |
+| `ZBLEND` | 0–10000 | 2250 | 0.001 mm | **seit Rev 4.17.0**: lineare Überblendung ± um jede Zonengrenze (ein Diabolo am Rand trifft beide Bereiche) |
+| `ZCAL` | `<A\|B\|C>,<mps>,<ofs0>,…,<ofs5>,<offx>,<offy>` bzw. `<A\|B\|C>,OFF` | OFF | m/s, ns, 0.001 mm | **seit Rev 4.17.0**: Satz einer Zone, atomar (alle 9 Werte geprüft, dann geschrieben). `mps` 300–400 (wirkt als Differenz zu `SOUNDSPEED`, eine DHT-Messung bleibt erhalten), `ofs` ±20000, `offx/offy` ±50000. `OFF` = Zone nutzt die Basiswerte. Antwort `{"type":"ok","set":"zcal","zone":"A","valid":1}` |
+| `RAWLOG` | 0/1 | 0 | – | **seit Rev 4.16.0**: 1 = zu jedem gültigen Schuss ein `raw`-Telegramm mit allen unkorrigierten Flanken und Parametern (siehe 4.5c). Wirkt sofort |
+| `DHT` | 0/1 | 0 | – | **seit Rev 4.15.0**: 1 = Schallgeschwindigkeit aus Temperatur/Luftfeuchte des DHT22 an **GPIO15** (siehe 7.2), Messung alle 30 s in Ruhephasen, erste Messung ca. 2,5 s nach dem Einschalten. 0 = fest `SOUNDSPEED`. Wirkt sofort |
 | `PAPERFEED` | 10.0-100.0 (mm) | 50.0 | – | Vorschubstrecke je Auslösung |
 | `PAPERSPEED` | 0.5-30.0 (mm/s) | 5.0 | – | Geschwindigkeit 1. Hälfte, danach Abbremsrampe |
 | `PAPERAUTO` | 0\|1 | 1 | – | automatischen Vorschub überhaupt ausführen |
@@ -544,7 +702,7 @@ Ablaufdiagramm siehe Abschnitt 7.6 sowie die Befehle `NET CONFIRM`/
 | `CAL START` | startet Sammlung von `SET CALSHOTS` verwertbaren Schüssen; läuft parallel zum Normalbetrieb (jede Auslösung erzeugt weiterhin auch `shot`/`reject`); Ergebnis siehe `cal`/`"done"` (4.6) |
 | `CAL ABORT` | bricht ab, Offsets bleiben unverändert |
 | `CAL STATUS` | liefert aktuellen Fortschritt, ohne den Ablauf zu beeinflussen |
-| `CAL RESET` | setzt alle `OFS0..OFS5` auf 0 und `SOUNDSPEED` auf 343 zurück (persistiert), Antwort `{"type":"ok","cmd":"cal_reset"}` |
+| `CAL RESET` | setzt alle `OFS0..OFS5` auf 0 und `SOUNDSPEED` auf 342.5 (bis Rev 4.14: 343) zurück (persistiert), Antwort `{"type":"ok","cmd":"cal_reset"}` |
 | `CAL IMPORT OFS0=<ns>,...,OFS5=<ns>,SOUNDSPEED=<mps>` | **seit Rev 4.9.0**: atomarer Bulk-Restore einer vom Stand-PC gespeicherten Kalibrierung (siehe 4.6/7.1) - alle Werte zuerst validieren, **erst danach** schreiben, kein Teilzustand bei Abbruch mitten in der Übertragung. Kommagetrennte `KEY=WERT`-Paare, Reihenfolge beliebig, nicht alle Keys müssen vorkommen (nur die angegebenen werden geändert). Gültige Keys: `OFS0`..`OFS5` (-20000..20000 ns) und `SOUNDSPEED` (300-400 m/s) - identische Wertebereiche wie bei den einzelnen `SET`-Befehlen. Antwort `{"type":"ok","cmd":"cal_import"}` oder `{"type":"error","msg":"cal import: bad key=value (...)"}` bei irgendeinem ungültigen Paar (dann wurde **nichts** geschrieben). |
 
 Ablauf im Detail siehe Abschnitt 7.4.
@@ -689,6 +847,36 @@ separate `piezo_ns`/`piezo_ok`-Felder. GPIO34 bleibt in der "zweiten Bank",
 das ist unkritisch, da die Piezo-Verzögerung (`PIEZOMIN`..`PIEZOMAX`,
 ≥100µs) weit außerhalb des ns-Bereichs dieses Effekts liegt.
 
+**Zeitstempel-Erfassung (`SET CAPTURE`, seit Rev 4.13.0):**
+
+- `ISR` (Default): jede Flanke löst einen GPIO-Interrupt aus, der den
+  CPU-Zykluszähler liest. Zwischen Flanke und Lesen liegt die
+  Interrupt-Latenz samt Jitter (WLAN-Interrupts, gemeinsamer Dispatcher).
+- `MCPWM`: jeder Kanal hängt an einem MCPWM-Capture-Kanal (Index 0-2 an
+  Gruppe 0, Index 3-5 an Gruppe 1, gleiche GPIOs wie oben). Die Hardware
+  friert den Zählerstand (APB, 80 MHz) zum Flankenzeitpunkt ein; die
+  Firmware rechnet ihn exakt in CPU-Zyklen um, alles Weitere (Ringpuffer,
+  Auswertung, Kalibrierung, `TESTSHOOT`) ist unverändert. Beide Gruppen
+  werden beim Boot über einen Impuls auf **GPIO23** gleichzeitig genullt -
+  dieser Pin wird dabei als Ausgang getrieben und **muss unbeschaltet
+  bleiben**. Das Piezo bleibt ein normaler GPIO-Interrupt (dient nur als
+  Gate mit ≥100 µs Spielraum).
+
+**Amplituden-Korrektur über die Pulsbreite (`SET WALKK`, seit Rev 4.14.0):**
+
+Ein leises Signal (fernes Mic, schräger Schalleinfall) überschreitet die
+Komparatorschwelle später als ein lautes. Diese Verzögerung hängt von der
+Trefferlage ab und lässt sich daher nicht per `OFS` wegkalibrieren. Ohne
+zusätzliche Hardware dient die **Pulsbreite** als Amplitudenmaß: Bei
+`CAPTURE=MCPWM` erfasst jeder Capture-Kanal zusätzlich die fallende Flanke;
+Pulsbreite = Zeit von der steigenden Flanke bis zur letzten fallenden Flanke
+vor der nächsten gespeicherten steigenden (höchstens `WALKMAX`, Preller
+< 300 ns zählen nicht). Ein lautes Signal ergibt einen breiteren Puls. Die
+Korrektur `WALKK·(w − w̄)` bezieht sich auf das Schuss-Mittel `w̄`, damit
+verschiebt sich die geschätzte Einschlagzeit (Piezo-Gate bei `ALGO=RIM`)
+nicht. Empfohlenes Vorgehen: `CAPTURE=MCPWM`, `CAL RESET`, `WALKCAL=1`,
+`CAL START` - danach steht der ermittelte Wert in `cal.walk_k`.
+
 ### 7.2 Koordinatensystem
 
 - **Ursprung:** Mittelpunkt der Zielfläche (Papierscheibe).
@@ -709,8 +897,18 @@ das ist unkritisch, da die Piezo-Verzögerung (`PIEZOMIN`..`PIEZOMAX`,
   betroffen.
 - Die Position wird per **TDOA-Hyperbel-Trilateration** aus den ersten
   Flankenzeiten von mindestens 3 Mikrofonen berechnet, mit einer
-  angenommenen Schallgeschwindigkeit `SET SOUNDSPEED` (Default 343 m/s,
-  klassischer Wert bei 20°C).
+  Schallgeschwindigkeit: bei `SET DHT=1` aus der DHT22-Messung, sonst
+  `SET SOUNDSPEED` (Default 342.5 m/s).
+- **Schallgeschwindigkeit aus Temperatur/Luftfeuchte (seit Rev 4.15.0):** Sie
+  ändert sich um ca. 0,6 m/s (0,18 %) je Kelvin; der Fehler wirkt wie ein
+  Maßstabsfehler, der mit dem Abstand vom Zentrum wächst. Berechnung:
+  `c = 331,3·√(1 + T/273,15)·(1 + 0,16·x_w)` mit dem Wasserdampf-
+  Stoffmengenanteil `x_w` (Sättigungsdampfdruck nach Magnus, Luftdruck fest
+  1013,25 hPa). Gegenüber der ausführlichen freETarget-Formel höchstens
+  0,12 m/s Abweichung zwischen -5 und 30 °C. Der DHT22 wird ohne
+  Interrupt-Sperre ausgelesen (Mic-Flanken bleiben unberührt), nur in
+  Ruhephasen. **Sensor möglichst nah an der Messstrecke** (Luft zwischen
+  Scheibe und Mikrofonen) platzieren, nicht neben warmer Elektronik.
 
 ### 7.3 Auswertungs-Pipeline je Auslösung (Kurzfassung)
 
@@ -772,6 +970,37 @@ Siehe `schusserkennung-rev5.md` für die vollständige Herleitung; Kurzfassung:
    `MAXPRECISION`/`RADIUS`/`MINCLUSTER` (die drei bleiben nur für
    `ALGO=CLASSIC` wirksam).
 
+### 7.3c Zonen-Kalibrierung (seit Rev 4.17.0, `SET ZONES=1`)
+
+Der Knall ist je nach getroffenen Papierlagen unterschiedlich laut; ein
+leiseres Signal erreicht die Komparatorschwelle später, und zwar umso später,
+je weiter das Mikrofon entfernt ist. Mit einem einzigen Parametersatz bleiben
+dadurch je Bereich systematische Abweichungen (Foto-Studie 12.10.2026: 2–4 mm).
+
+| Zone | Bereich | Bedingung |
+|---|---|---|
+| A | im Loch der Vorsatzscheibe (nur Schussband) | r < `ZHOLE` |
+| B | neben dem Schussband (nur Vorsatzscheibe) | \|x\| > `ZBAND` |
+| C | Schussband + Vorsatzscheibe | sonst |
+
+Ablauf je gültigem Schuss (nur `ALGO=CLASSIC`):
+
+1. Lage wie bisher mit den Basiswerten (`SOUNDSPEED`, `OFS<i>`, `OFFSETX/Y`).
+2. Zonen-Gewichte aus dieser Lage: wA = Rampe(r, `ZHOLE`), wB = 1 − Rampe(\|x\|,
+   `ZBAND`), Gewichte {wA, (1−wA)·wB, (1−wA)·(1−wB)}; Rampe = 1 bis Grenze −
+   `ZBLEND`, 0 ab Grenze + `ZBLEND`, linear dazwischen.
+3. Für jede Zone mit Gewicht > 0 neu rechnen mit ihrem Satz (`ZCAL`; ohne Satz
+   die Basiswerte), Ergebnis inkl. Nachkorrektur der Zone, Lage gewichtet
+   mitteln; `pos_res_um`/`precision_um`/`cluster_hits` von der Zone mit dem
+   größten Anteil.
+4. Ändern sich die Gewichte mit der neuen Lage, Schritte 2–3 wiederholen
+   (höchstens 3 Durchgänge).
+
+Der Server-Simulator rechnet identisch (`server/sim_zones.go`); die Sätze
+entstehen dort per Foto-Kalibrierung („One-Click“) und werden per `SET ZCAL`
+übertragen. `CAL START` und `CAL IMPORT` ändern nur die Basiswerte, `CAL RESET`
+verwirft zusätzlich die Zonen-Sätze.
+
 ### 7.4 Kalibrierungsablauf (`CAL START`)
 
 Läuft in **beiden** Auswertepfaden (`SET ALGO`) gleich ab und kalibriert
@@ -802,7 +1031,9 @@ wird intern die RMS-Residuen-Summe der Ausgleichsrechnung statt der
    gefolgt von einem vollen `config`-Telegramm.
 5. **`SOUNDSPEED` wird von diesem Vorgang nicht verändert** - trotz des
    Felds `sound_mps` im `"done"`-Telegramm (das ist nur der aktuell
-   gültige, unveränderte Wert, informativ mitgeliefert).
+   gültige, unveränderte Wert, informativ mitgeliefert). Bei `SET DHT=1`
+   gehen die Offsets mit der jeweils gemessenen Schallgeschwindigkeit in die
+   Suche ein (`sound_act_mps`).
 6. `CAL ABORT` jederzeit möglich, verwirft die bisher gesammelten (noch
    nicht ausgewerteten) Schüsse ohne die gespeicherten Offsets zu ändern.
 7. **Restore (seit Rev 4.9.0):** eine zuvor über `cal`/`"done"` mitgeschnittene

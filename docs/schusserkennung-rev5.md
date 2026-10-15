@@ -14,7 +14,11 @@
 > weiter in Kraft (nur bei `ALGO=RIM` wirkungslos). Die Hardware-Zeitstempel-
 > Präzisionshinweise aus Abschnitt 4 (Zykluszähler zuerst) sind umgesetzt und
 > wirken auf beide Pfade; die MCPWM-Hardware-Capture-Idee (Abschnitt 4, Punkt
-> 3) ist **nicht** umgesetzt und bleibt ein möglicher weiterer Schritt.
+> 3) ist seit **Rev 4.13.0** als `SET CAPTURE=MCPWM` umgesetzt (Default
+> weiterhin `ISR`). Abweichend vom Entwurf bleibt der CPU-Zykluszähler die
+> gemeinsame Zeitbasis: der Capture-Callback rechnet den Hardware-Stempel
+> exakt in Zyklen um, Ringpuffer und Auswertung bleiben unverändert (siehe
+> `airCaptureInit()`/`airCapCallback()`).
 > `host_sim.cpp`/`gen_rim_log.py` liegen unter `test/sim/`, nicht `test/`.
 
 ## 1. Was am bisherigen Zeitfenster nicht robust ist
@@ -249,3 +253,7 @@ es dient nur als Gate.
    spätere Schwellenüberschreitung). Wirkt wie eine falsche Schallgeschwindigkeit
    und wird von `SET SOUNDSPEED` teilweise aufgefangen (die empirischen 355 m/s
    könnten auch daher kommen).
+   **Umgesetzt seit Rev 4.14.0** (ohne Zusatzhardware): Bei `SET CAPTURE=MCPWM`
+   wird zusätzlich die fallende Flanke erfasst; die Pulsbreite dient als
+   Amplitudenmaß, `SET WALKK` korrigiert `t += K·(w − w̄)` (per `SET WALKCAL=1`
+   in `CAL START` mitbestimmbar) - siehe `edgeWidthNs()`/`walkDeltas()`.
